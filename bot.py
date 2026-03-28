@@ -110,10 +110,8 @@ def _build_security_keyboard(
     callback_data_deal = f"d:{new_member_id}:{group_chat_id}"
     callback_data_kick = f"k:{new_member_id}:{group_chat_id}"
     keyboard = [
-        [
-            InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal),
-            InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick),
-        ]
+        [InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal)],
+        [InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick)],
     ]
     return InlineKeyboardMarkup(keyboard)
 

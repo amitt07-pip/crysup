@@ -46,6 +46,10 @@ AUTO_KICK_TIMEOUT = 30 * 60
 # Security check interval in seconds (1 hour)
 SECURITY_CHECK_INTERVAL = 60 * 60
 
+# In-memory store for member display info (keyed by "member_id:group_id")
+# Used to keep callback data under Telegram's 64-byte limit
+_member_info: dict[str, dict[str, str | int]] = {}
+
 
 def _get_username_display(user) -> str:
     """Return @username if available, otherwise the user's full name."""
@@ -74,6 +78,22 @@ def _build_security_message(
     )
 
 
+def _store_member_info(
+    new_member_id: int,
+    group_chat_id: int,
+    hours: int,
+    new_member_display: str,
+    added_by_display: str,
+) -> None:
+    """Store member display info in memory for callback lookups."""
+    key = f"{new_member_id}:{group_chat_id}"
+    _member_info[key] = {
+        "member_disp": new_member_display,
+        "adder_disp": added_by_display,
+        "hours": hours,
+    }
+
+
 def _build_security_keyboard(
     new_member_id: int,
     group_chat_id: int,
@@ -82,19 +102,13 @@ def _build_security_keyboard(
     added_by_display: str,
 ) -> InlineKeyboardMarkup:
     """Build inline keyboard for the security protocol message."""
-    callback_data_deal = json.dumps({
-        "action": "still_deal",
-        "member_id": new_member_id,
-        "group_id": group_chat_id,
-        "hours": hours,
-        "member_disp": new_member_display,
-        "adder_disp": added_by_display,
-    })
-    callback_data_kick = json.dumps({
-        "action": "kick_member",
-        "member_id": new_member_id,
-        "group_id": group_chat_id,
-    })
+    # Store display info in memory so callback data stays under 64 bytes
+    _store_member_info(
+        new_member_id, group_chat_id, hours, new_member_display, added_by_display
+    )
+    # Compact callback data: "d:member_id:group_id" for deal, "k:member_id:group_id" for kick
+    callback_data_deal = f"d:{new_member_id}:{group_chat_id}"
+    callback_data_kick = f"k:{new_member_id}:{group_chat_id}"
     keyboard = [
         [
             InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal),
@@ -236,17 +250,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
 
-    try:
-        data = json.loads(query.data)
-    except (json.JSONDecodeError, TypeError):
+    raw = query.data or ""
+    parts = raw.split(":")
+    if len(parts) < 3:
         return
 
-    action = data.get("action")
+    action = parts[0]  # "d" for deal, "k" for kick
+    member_id = int(parts[1])
+    group_id = int(parts[2])
+    info_key = f"{member_id}:{group_id}"
 
-    if action == "kick_member":
-        member_id = data["member_id"]
-        group_id = data["group_id"]
-
+    if action == "k":
         # Cancel the auto-kick job
         job_name = f"autokick_{member_id}_{group_id}"
         existing_jobs = context.job_queue.get_jobs_by_name(job_name)
@@ -259,6 +273,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for job in sec_jobs:
             job.schedule_removal()
 
+        # Clean up stored info
+        _member_info.pop(info_key, None)
+
         try:
             await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
             await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
@@ -268,12 +285,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(f"Failed to kick member: {e}")
             logger.error("Failed to kick member %s: %s", member_id, e)
 
-    elif action == "still_deal":
-        member_id = data["member_id"]
-        group_id = data["group_id"]
-        hours = data["hours"]
-        new_member_display = data["member_disp"]
-        added_by_display = data["adder_disp"]
+    elif action == "d":
+        info = _member_info.get(info_key, {})
+        hours = int(info.get("hours", 1))
+        new_member_display = str(info.get("member_disp", "Unknown"))
+        added_by_display = str(info.get("adder_disp", "Unknown"))
 
         # Cancel the auto-kick job
         job_name = f"autokick_{member_id}_{group_id}"

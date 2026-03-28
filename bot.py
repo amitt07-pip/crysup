@@ -676,6 +676,70 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error("Failed to send unknown members list: %s", e)
 
 
+async def _resolve_user(
+    message, text: str, context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[int | None, str | None]:
+    """Resolve a user from message entities, reply, or text argument.
+
+    Returns (user_id, display_name) or (None, None) if unresolved.
+    """
+    resolved_user_id = None
+    resolved_display = None
+
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "text_mention":
+                _cache_user(entity.user)
+                resolved_user_id = entity.user.id
+                resolved_display = _get_username_display(entity.user)
+                break
+            elif entity.type == "mention":
+                username_text = message.text[entity.offset:entity.offset + entity.length].lstrip("@").lower()
+                cached = _username_cache.get(username_text)
+                if cached:
+                    resolved_user_id = cached["user_id"]
+                    resolved_display = f"@{cached['username']}"
+                else:
+                    try:
+                        chat_obj = await context.bot.get_chat(chat_id=f"@{username_text}")
+                        _cache_user(chat_obj)
+                        resolved_user_id = chat_obj.id
+                        resolved_display = _get_username_display(chat_obj)
+                    except Exception:
+                        pass
+                break
+
+    if resolved_user_id is None and message.reply_to_message and message.reply_to_message.from_user:
+        reply_user = message.reply_to_message.from_user
+        _cache_user(reply_user)
+        resolved_user_id = reply_user.id
+        resolved_display = _get_username_display(reply_user)
+
+    if resolved_user_id is None:
+        parts = text.split()
+        if len(parts) >= 2:
+            arg = parts[1].strip()
+            if arg.isdigit():
+                try:
+                    member = await context.bot.get_chat_member(
+                        chat_id=MONITORED_GROUP_ID,
+                        user_id=int(arg),
+                    )
+                    _cache_user(member.user)
+                    resolved_user_id = member.user.id
+                    resolved_display = _get_username_display(member.user)
+                except Exception as e:
+                    logger.warning("Could not resolve user ID %s: %s", arg, e)
+            else:
+                username_raw = arg.lstrip("@").lower()
+                cached = _username_cache.get(username_raw)
+                if cached:
+                    resolved_user_id = cached["user_id"]
+                    resolved_display = f"@{cached['username']}"
+
+    return resolved_user_id, resolved_display
+
+
 async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle !add @username — lets known members manually add users to tracking."""
     message = update.effective_message
@@ -691,77 +755,13 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not sender or sender.id not in KNOWN_MEMBER_IDS:
         return
 
-    # Only works in the monitored group
     chat = update.effective_chat
-    if not chat or chat.id != MONITORED_GROUP_ID:
+    if not chat:
         return
 
-    # Cache the sender
     _cache_user(sender)
 
-    # Extract mentioned user from entities or reply
-    resolved_user_id = None
-    resolved_display = None
-    resolved_username = None
-
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "text_mention":
-                # User without a public username — entity has user object
-                _cache_user(entity.user)
-                resolved_user_id = entity.user.id
-                resolved_display = _get_username_display(entity.user)
-                break
-            elif entity.type == "mention":
-                # @username mention — look up in cache
-                username_text = message.text[entity.offset:entity.offset + entity.length].lstrip("@").lower()
-                cached = _username_cache.get(username_text)
-                if cached:
-                    resolved_user_id = cached["user_id"]
-                    resolved_display = f"@{cached['username']}"
-                    resolved_username = cached["username"]
-                else:
-                    # Try get_chat_member with username — won't work for users, but try anyway
-                    try:
-                        chat_obj = await context.bot.get_chat(chat_id=f"@{username_text}")
-                        _cache_user(chat_obj)
-                        resolved_user_id = chat_obj.id
-                        resolved_display = _get_username_display(chat_obj)
-                    except Exception:
-                        pass
-                break
-
-    # Support reply-based adding: !add as reply to a user's message
-    if resolved_user_id is None and message.reply_to_message and message.reply_to_message.from_user:
-        reply_user = message.reply_to_message.from_user
-        _cache_user(reply_user)
-        resolved_user_id = reply_user.id
-        resolved_display = _get_username_display(reply_user)
-
-    # Fallback: parse username or user ID from text (no entity match)
-    if resolved_user_id is None:
-        parts = text.split()
-        if len(parts) >= 2:
-            arg = parts[1].strip()
-            if arg.isdigit():
-                # Numeric user ID — resolve via get_chat_member
-                try:
-                    member = await context.bot.get_chat_member(
-                        chat_id=MONITORED_GROUP_ID,
-                        user_id=int(arg),
-                    )
-                    _cache_user(member.user)
-                    resolved_user_id = member.user.id
-                    resolved_display = _get_username_display(member.user)
-                except Exception as e:
-                    logger.warning("Could not resolve user ID %s: %s", arg, e)
-            else:
-                # Username — look up in cache
-                username_raw = arg.lstrip("@").lower()
-                cached = _username_cache.get(username_raw)
-                if cached:
-                    resolved_user_id = cached["user_id"]
-                    resolved_display = f"@{cached['username']}"
+    resolved_user_id, resolved_display = await _resolve_user(message, text, context)
 
     if resolved_user_id is None:
         await message.reply_text(
@@ -773,12 +773,11 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     new_member_display = resolved_display or f"User {resolved_user_id}"
     adder_display = _get_username_display(sender)
-    group_chat_id = chat.id
 
-    # Store in member info
+    # Store in member info — always use monitored group as the group_chat_id
     _store_member_info(
         new_member_id=resolved_user_id,
-        group_chat_id=group_chat_id,
+        group_chat_id=MONITORED_GROUP_ID,
         hours=1,
         new_member_display=new_member_display,
         added_by_display=adder_display,
@@ -789,7 +788,7 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await schedule_security_check(
         context,
         new_member_id=resolved_user_id,
-        group_chat_id=group_chat_id,
+        group_chat_id=MONITORED_GROUP_ID,
         hours=1,
         new_member_display=new_member_display,
         added_by_display=adder_display,
@@ -802,6 +801,98 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     logger.info(
         "Known member %s manually added %s (%s) to tracking",
+        sender.id, resolved_user_id, new_member_display,
+    )
+
+
+async def handle_12hr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !12hr @username/user_id — lets known members manually apply 12h skip."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!12hr"):
+        return
+
+    # Only known members can use this command
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    _cache_user(sender)
+
+    resolved_user_id, resolved_display = await _resolve_user(message, text, context)
+
+    if resolved_user_id is None:
+        await message.reply_text(
+            "Could not resolve the user. Make sure the username or user ID is correct.\n\n"
+            "You can also reply to a message from that user with <b>!12hr</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    new_member_display = resolved_display or f"User {resolved_user_id}"
+    info_key = f"{resolved_user_id}:{MONITORED_GROUP_ID}"
+    info = _member_info.get(info_key, {})
+
+    if not info:
+        await message.reply_text(
+            f"{new_member_display} is not currently being tracked. Use <b>!add</b> first.",
+            parse_mode="HTML",
+        )
+        return
+
+    if info.get("12h_used"):
+        await message.reply_text(
+            f"The +12 Hours skip has already been used for {new_member_display}.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Mark as used
+    info["12h_used"] = True
+    _member_info[info_key] = info
+    _save_data()
+
+    # Cancel the auto-kick job
+    job_name = f"autokick_{resolved_user_id}_{MONITORED_GROUP_ID}"
+    existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in existing_jobs:
+        job.schedule_removal()
+
+    # Cancel any pending security check job
+    sec_job_name = f"security_{resolved_user_id}_{MONITORED_GROUP_ID}"
+    sec_jobs = context.job_queue.get_jobs_by_name(sec_job_name)
+    for job in sec_jobs:
+        job.schedule_removal()
+
+    adder_display = _get_username_display(sender)
+    hours = int(info.get("hours", 1))
+    added_by_display = str(info.get("adder_disp", adder_display))
+
+    # Schedule next check in 12 hours
+    await schedule_security_check(
+        context,
+        new_member_id=resolved_user_id,
+        group_chat_id=MONITORED_GROUP_ID,
+        hours=hours + 12,
+        new_member_display=new_member_display,
+        added_by_display=added_by_display,
+        adder_id=int(info.get("adder_id", sender.id)),
+    )
+
+    await message.reply_text(
+        f"<b>+12 Hours skip applied</b> for {new_member_display} (<code>{resolved_user_id}</code>) by {adder_display}.\n"
+        f"Next security check in 12 hours.",
+        parse_mode="HTML",
+    )
+    logger.info(
+        "Known member %s applied 12h skip for %s (%s)",
         sender.id, resolved_user_id, new_member_display,
     )
 
@@ -864,6 +955,11 @@ def main() -> None:
     # !add @username handler for known members to manually track users
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!add"), handle_add_command)
+    )
+
+    # !12hr @username handler for known members to manually apply 12h skip
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!12hr"), handle_12hr_command)
     )
 
     # Catch-all handler to cache usernames from all messages in the monitored group

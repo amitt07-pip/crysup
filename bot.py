@@ -424,7 +424,6 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 text="📋 <b>Unknown Members List</b>\n\nNo tracked unknown members currently in the group.",
                 parse_mode="HTML",
             )
-            await update.message.reply_text("Unknown members list sent to security channel.")
             return
 
         lines = []
@@ -450,10 +449,8 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text=message_text,
             parse_mode="HTML",
         )
-        await update.message.reply_text("Unknown members list sent to security channel.")
     except Exception as e:
         logger.error("Failed to send unknown members list: %s", e)
-        await update.message.reply_text(f"Failed to get member list: {e}")
 
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -472,7 +469,6 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         added_by_display=test_adder_display,
         target_chat_id=update.effective_chat.id,
     )
-    await update.message.reply_text("Test security protocol message sent!")
 
 
 def main() -> None:

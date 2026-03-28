@@ -1,11 +1,14 @@
+import json
 import os
 import logging
 from datetime import datetime, timezone
 
-from telegram import Update, ChatMember
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ChatMember
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatMemberHandler,
+    CommandHandler,
     ContextTypes,
 )
 
@@ -18,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
+SECURITY_CHANNEL_ID = "-1002215462357"
 
 # Known member user IDs — additions by these users are considered trusted
 KNOWN_MEMBER_IDS = {
@@ -37,12 +41,254 @@ KNOWN_MEMBER_IDS = {
     7715451354,
 }
 
+# Auto-kick timeout in seconds (30 minutes)
+AUTO_KICK_TIMEOUT = 30 * 60
+# Security check interval in seconds (1 hour)
+SECURITY_CHECK_INTERVAL = 60 * 60
+
 
 def _get_username_display(user) -> str:
     """Return @username if available, otherwise the user's full name."""
     if user.username:
         return f"@{user.username}"
     return user.full_name
+
+
+def _build_security_message(
+    new_member_display: str,
+    added_by_display: str,
+    hours: int,
+) -> str:
+    """Build the security protocol message."""
+    hour_text = f"{hours} hour" if hours == 1 else f"{hours} hours"
+    return (
+        f"‼️ <b>SECURITY PROTOCOL</b> ‼️\n"
+        f"\n"
+        f"{new_member_display} (added by {added_by_display}) "
+        f"is still in the group for more than {hour_text}, "
+        f'if the deal is still running then click on '
+        f'"✅ I am still doing deal" '
+        f'if not then click on "❌ Kick Member" '
+        f"please respond to the message within 30 minutes "
+        f"or the member will be auto kicked."
+    )
+
+
+def _build_security_keyboard(
+    new_member_id: int,
+    group_chat_id: int,
+    hours: int,
+    new_member_display: str,
+    added_by_display: str,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for the security protocol message."""
+    callback_data_deal = json.dumps({
+        "action": "still_deal",
+        "member_id": new_member_id,
+        "group_id": group_chat_id,
+        "hours": hours,
+        "member_disp": new_member_display,
+        "adder_disp": added_by_display,
+    })
+    callback_data_kick = json.dumps({
+        "action": "kick_member",
+        "member_id": new_member_id,
+        "group_id": group_chat_id,
+    })
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal),
+            InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_security_check(
+    context: ContextTypes.DEFAULT_TYPE,
+    new_member_id: int,
+    group_chat_id: int,
+    hours: int,
+    new_member_display: str,
+    added_by_display: str,
+) -> None:
+    """Send security protocol message and schedule auto-kick."""
+    message_text = _build_security_message(new_member_display, added_by_display, hours)
+    keyboard = _build_security_keyboard(
+        new_member_id, group_chat_id, hours, new_member_display, added_by_display
+    )
+
+    try:
+        sent_msg = await context.bot.send_message(
+            chat_id=int(SECURITY_CHANNEL_ID),
+            text=message_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        logger.info(
+            "Sent security check for member %s in group %s (hour %s)",
+            new_member_id,
+            group_chat_id,
+            hours,
+        )
+
+        # Schedule auto-kick after 30 minutes if no response
+        job_name = f"autokick_{new_member_id}_{group_chat_id}"
+        # Remove any existing auto-kick job for this member
+        existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in existing_jobs:
+            job.schedule_removal()
+
+        context.job_queue.run_once(
+            auto_kick_member,
+            when=AUTO_KICK_TIMEOUT,
+            name=job_name,
+            data={
+                "member_id": new_member_id,
+                "group_id": group_chat_id,
+                "message_id": sent_msg.message_id,
+            },
+        )
+    except Exception as e:
+        logger.error("Failed to send security check: %s", e)
+
+
+async def schedule_security_check(
+    context: ContextTypes.DEFAULT_TYPE,
+    new_member_id: int,
+    group_chat_id: int,
+    hours: int,
+    new_member_display: str,
+    added_by_display: str,
+) -> None:
+    """Schedule the first (or next) security check after SECURITY_CHECK_INTERVAL."""
+    job_name = f"security_{new_member_id}_{group_chat_id}"
+    # Remove any existing security check job for this member
+    existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in existing_jobs:
+        job.schedule_removal()
+
+    context.job_queue.run_once(
+        _security_check_job,
+        when=SECURITY_CHECK_INTERVAL,
+        name=job_name,
+        data={
+            "member_id": new_member_id,
+            "group_id": group_chat_id,
+            "hours": hours,
+            "member_disp": new_member_display,
+            "adder_disp": added_by_display,
+        },
+    )
+    logger.info(
+        "Scheduled security check for member %s in %s seconds (hour %s)",
+        new_member_id,
+        SECURITY_CHECK_INTERVAL,
+        hours,
+    )
+
+
+async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job callback that sends the security check message."""
+    data = context.job.data
+    await send_security_check(
+        context,
+        new_member_id=data["member_id"],
+        group_chat_id=data["group_id"],
+        hours=data["hours"],
+        new_member_display=data["member_disp"],
+        added_by_display=data["adder_disp"],
+    )
+
+
+async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Auto-kick member after 30 minutes of no response."""
+    data = context.job.data
+    member_id = data["member_id"]
+    group_id = data["group_id"]
+    message_id = data["message_id"]
+
+    try:
+        await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
+        await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
+        logger.info("Auto-kicked member %s from group %s", member_id, group_id)
+
+        # Edit the security message to indicate auto-kick
+        try:
+            await context.bot.edit_message_text(
+                chat_id=int(SECURITY_CHANNEL_ID),
+                message_id=message_id,
+                text="⚠️ Member was auto-kicked due to no response within 30 minutes.",
+            )
+        except Exception as e:
+            logger.error("Failed to edit security message after auto-kick: %s", e)
+
+    except Exception as e:
+        logger.error("Failed to auto-kick member %s from group %s: %s", member_id, group_id, e)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button presses on security protocol messages."""
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        data = json.loads(query.data)
+    except (json.JSONDecodeError, TypeError):
+        return
+
+    action = data.get("action")
+
+    if action == "kick_member":
+        member_id = data["member_id"]
+        group_id = data["group_id"]
+
+        # Cancel the auto-kick job
+        job_name = f"autokick_{member_id}_{group_id}"
+        existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in existing_jobs:
+            job.schedule_removal()
+
+        # Cancel any pending security check job
+        sec_job_name = f"security_{member_id}_{group_id}"
+        sec_jobs = context.job_queue.get_jobs_by_name(sec_job_name)
+        for job in sec_jobs:
+            job.schedule_removal()
+
+        try:
+            await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
+            await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
+            await query.edit_message_text("❌ Member has been kicked from the group.")
+            logger.info("Kicked member %s from group %s via button", member_id, group_id)
+        except Exception as e:
+            await query.edit_message_text(f"Failed to kick member: {e}")
+            logger.error("Failed to kick member %s: %s", member_id, e)
+
+    elif action == "still_deal":
+        member_id = data["member_id"]
+        group_id = data["group_id"]
+        hours = data["hours"]
+        new_member_display = data["member_disp"]
+        added_by_display = data["adder_disp"]
+
+        # Cancel the auto-kick job
+        job_name = f"autokick_{member_id}_{group_id}"
+        existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in existing_jobs:
+            job.schedule_removal()
+
+        # Update the message to confirm
+        await query.edit_message_text("✅ Deal confirmed. Will check again in 1 hour.")
+
+        # Schedule another check in 1 hour with incremented hours
+        await schedule_security_check(
+            context,
+            new_member_id=member_id,
+            group_chat_id=group_id,
+            hours=hours + 1,
+            new_member_display=new_member_display,
+            added_by_display=added_by_display,
+        )
 
 
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -76,6 +322,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     new_member = result.new_chat_member.user
     added_by = result.from_user
+    group_chat_id = result.chat.id
     timestamp = result.date or datetime.now(timezone.utc)
     formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -87,6 +334,16 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         log_message = (
             f"~ {new_member_display} (<code>{new_member.id}</code>) has been added by "
             f"{added_by_display} (<code>{added_by.id}</code>) in the CryptoIndia Group ‼️"
+        )
+
+        # Schedule security check after 1 hour
+        await schedule_security_check(
+            context,
+            new_member_id=new_member.id,
+            group_chat_id=group_chat_id,
+            hours=1,
+            new_member_display=new_member_display,
+            added_by_display=added_by_display,
         )
     else:
         # Unknown person added someone — alert
@@ -117,6 +374,25 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.error("Failed to send log message: %s", e)
 
 
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a test security protocol message for debugging."""
+    # Use dummy data for testing
+    test_member_display = "@test_member"
+    test_adder_display = "@test_adder"
+    test_member_id = 123456789
+    test_group_id = update.effective_chat.id
+
+    await send_security_check(
+        context,
+        new_member_id=test_member_id,
+        group_chat_id=test_group_id,
+        hours=1,
+        new_member_display=test_member_display,
+        added_by_display=test_adder_display,
+    )
+    await update.message.reply_text("Test security protocol message sent!")
+
+
 def main() -> None:
     """Start the bot."""
     if not BOT_TOKEN:
@@ -134,6 +410,12 @@ def main() -> None:
     application.add_handler(
         ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER)
     )
+
+    # Handle inline button callbacks
+    application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # /test command for testing security protocol
+    application.add_handler(CommandHandler("test", test_command))
 
     logger.info("Bot started — monitoring group activity...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -71,8 +71,8 @@ def _build_security_message(
         f"{new_member_display} (added by {added_by_display}) "
         f"is still in the group for more than {hour_text}, "
         f'if the deal is still running then click on '
-        f'"✅ I am still doing deal" '
-        f'if not then click on "❌ Kick Member" '
+        f'"<b>✅ I am still doing deal</b>" '
+        f'if not then click on "<b>❌ Kick Member</b>" '
         f"please respond to the message within 30 minutes "
         f"or the member will be auto kicked."
     )

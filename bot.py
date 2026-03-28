@@ -1,7 +1,7 @@
 import json
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ChatMember
 from telegram.ext import (
@@ -359,8 +359,10 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     new_member = result.new_chat_member.user
     added_by = result.from_user
     group_chat_id = result.chat.id
+    IST = timezone(timedelta(hours=5, minutes=30))
     timestamp = result.date or datetime.now(timezone.utc)
-    formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+    ist_time = timestamp.astimezone(IST)
+    formatted_time = ist_time.strftime("%Y-%m-%d %H:%M:%S IST")
 
     added_by_display = _get_username_display(added_by)
     new_member_display = _get_username_display(new_member)

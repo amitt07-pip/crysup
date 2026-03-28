@@ -89,11 +89,13 @@ def _store_member_info(
 ) -> None:
     """Store member display info in memory for callback lookups."""
     key = f"{new_member_id}:{group_chat_id}"
+    existing = _member_info.get(key, {})
     _member_info[key] = {
         "member_disp": new_member_display,
         "adder_disp": added_by_display,
         "hours": hours,
         "adder_id": adder_id,
+        "added_at": existing.get("added_at", datetime.now(timezone.utc)),
     }
 
 
@@ -238,13 +240,24 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
         logger.info("Auto-kicked member %s from group %s", member_id, group_id)
 
-        # Edit the security message to indicate auto-kick
+        # Edit the security message: keep original text, remove buttons, append status
         sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
         try:
+            msg = await context.bot.edit_message_reply_markup(
+                chat_id=sent_chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+            original_text = ""
+            if hasattr(msg, "text_html") and msg.text_html:
+                original_text = msg.text_html
+            elif hasattr(msg, "text") and msg.text:
+                original_text = msg.text
             await context.bot.edit_message_text(
                 chat_id=sent_chat_id,
                 message_id=message_id,
-                text="⚠️ Member was auto-kicked due to no response within 30 minutes.",
+                text=f"{original_text}\n\nStatus: Auto-Kicked (no response within 30 minutes)",
+                parse_mode="HTML",
             )
         except Exception as e:
             logger.error("Failed to edit security message after auto-kick: %s", e)
@@ -294,7 +307,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
             await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
-            await query.edit_message_text("❌ Member has been kicked from the group.")
+            # Keep original message, remove buttons, append status
+            original_text = query.message.text_html or query.message.text or ""
+            await query.edit_message_text(
+                text=f"{original_text}\n\nStatus: Kicked",
+                parse_mode="HTML",
+            )
             logger.info("Kicked member %s from group %s via button", member_id, group_id)
         except Exception as e:
             await query.edit_message_text(f"Failed to kick member: {e}")
@@ -313,8 +331,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for job in existing_jobs:
             job.schedule_removal()
 
-        # Update the message to confirm
-        await query.edit_message_text("✅ Deal confirmed. Will check again in 1 hour.")
+        # Update the message to confirm, include member and adder info
+        await query.edit_message_text(
+            text=(
+                f"✅ Deal confirmed. Will check again in 1 hour.\n\n"
+                f"- {new_member_display} (added by {added_by_display})"
+            ),
+            parse_mode="HTML",
+        )
 
         # Schedule another check in 1 hour with incremented hours
         await schedule_security_check(
@@ -431,14 +455,28 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         lines = []
+        now = datetime.now(timezone.utc)
         for key in tracked_keys:
             info = _member_info[key]
             member_disp = info.get("member_disp", "Unknown")
             adder_disp = info.get("adder_disp", "Unknown")
+            added_at = info.get("added_at")
             parts = key.split(":")
             member_id = parts[0]
+            # Calculate duration since added
+            if added_at:
+                delta = now - added_at
+                total_seconds = int(delta.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                if hours > 0:
+                    duration_text = f"{hours}h {minutes}m"
+                else:
+                    duration_text = f"{minutes}m"
+            else:
+                duration_text = "unknown"
             lines.append(
-                f"• {member_disp} (<code>{member_id}</code>) — added by {adder_disp}"
+                f"• {member_disp} (<code>{member_id}</code>) — added by {adder_disp} — in group since {duration_text}"
             )
 
         member_list = "\n".join(lines)

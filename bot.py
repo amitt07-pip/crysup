@@ -55,37 +55,68 @@ SECURITY_CHECK_INTERVAL = 60 * 60
 _DATA_FILE = Path(__file__).parent / "member_data.json"
 _member_info: dict[str, dict] = {}
 
+# Username cache: lowercase username -> {"user_id": int, "first_name": str, "username": str}
+_username_cache: dict[str, dict] = {}
+
 
 def _save_data() -> None:
-    """Persist _member_info to disk."""
-    serializable = {}
+    """Persist _member_info and _username_cache to disk."""
+    serializable_members = {}
     for key, val in _member_info.items():
         entry = dict(val)
         # Convert datetime to ISO string for JSON
         if isinstance(entry.get("added_at"), datetime):
             entry["added_at"] = entry["added_at"].isoformat()
-        serializable[key] = entry
+        serializable_members[key] = entry
     try:
-        _DATA_FILE.write_text(json.dumps(serializable, indent=2))
+        data = {
+            "members": serializable_members,
+            "username_cache": _username_cache,
+        }
+        _DATA_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
         logger.error("Failed to save member data: %s", e)
 
 
 def _load_data() -> None:
-    """Load _member_info from disk on startup."""
-    global _member_info
+    """Load _member_info and _username_cache from disk on startup."""
+    global _member_info, _username_cache
     if not _DATA_FILE.exists():
         return
     try:
         raw = json.loads(_DATA_FILE.read_text())
-        for key, val in raw.items():
+        # Support both old format (flat dict) and new format ({"members": ..., "username_cache": ...})
+        if "members" in raw and isinstance(raw["members"], dict):
+            members_raw = raw["members"]
+            _username_cache = raw.get("username_cache", {})
+        else:
+            # Old format: raw is the member dict directly
+            members_raw = raw
+        for key, val in members_raw.items():
             # Convert ISO string back to datetime
             if isinstance(val.get("added_at"), str):
                 val["added_at"] = datetime.fromisoformat(val["added_at"])
             _member_info[key] = val
-        logger.info("Loaded %d member entries from disk", len(_member_info))
+        logger.info("Loaded %d member entries, %d cached usernames from disk",
+                    len(_member_info), len(_username_cache))
     except Exception as e:
         logger.error("Failed to load member data: %s", e)
+
+
+def _cache_user(user) -> None:
+    """Cache a user's username -> user_id mapping for later lookup."""
+    if user and getattr(user, "username", None):
+        key = user.username.lower()
+        new_entry = {
+            "user_id": user.id,
+            "first_name": getattr(user, "first_name", "") or "",
+            "last_name": getattr(user, "last_name", "") or "",
+            "username": user.username,
+        }
+        # Only write to disk if the entry is new or changed
+        if _username_cache.get(key) != new_entry:
+            _username_cache[key] = new_entry
+            _save_data()
 
 
 def _get_username_display(user) -> str:
@@ -534,6 +565,10 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     new_member = result.new_chat_member.user
     added_by = result.from_user
     group_chat_id = result.chat.id
+
+    # Cache both users for !add @username lookup
+    _cache_user(new_member)
+    _cache_user(added_by)
     IST = timezone(timedelta(hours=5, minutes=30))
     timestamp = result.date or datetime.now(timezone.utc)
     ist_time = timestamp.astimezone(IST)
@@ -661,56 +696,88 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not chat or chat.id != MONITORED_GROUP_ID:
         return
 
-    # Extract mentioned user from entities
-    mentioned_user = None
+    # Cache the sender
+    _cache_user(sender)
+
+    # Extract mentioned user from entities or reply
+    resolved_user_id = None
+    resolved_display = None
+    resolved_username = None
+
     if message.entities:
         for entity in message.entities:
             if entity.type == "text_mention":
-                # User without a username — entity contains user object
-                mentioned_user = entity.user
+                # User without a public username — entity has user object
+                _cache_user(entity.user)
+                resolved_user_id = entity.user.id
+                resolved_display = _get_username_display(entity.user)
                 break
             elif entity.type == "mention":
-                # User has a @username — resolve via get_chat
-                username_text = message.text[entity.offset:entity.offset + entity.length]
-                try:
-                    chat_obj = await context.bot.get_chat(chat_id=username_text)
-                    # Create a minimal user-like object from the Chat object
-                    mentioned_user = chat_obj
-                except Exception as e:
-                    logger.warning("Could not resolve %s via get_chat: %s", username_text, e)
+                # @username mention — look up in cache
+                username_text = message.text[entity.offset:entity.offset + entity.length].lstrip("@").lower()
+                cached = _username_cache.get(username_text)
+                if cached:
+                    resolved_user_id = cached["user_id"]
+                    resolved_display = f"@{cached['username']}"
+                    resolved_username = cached["username"]
+                else:
+                    # Try get_chat_member with username — won't work for users, but try anyway
+                    try:
+                        chat_obj = await context.bot.get_chat(chat_id=f"@{username_text}")
+                        _cache_user(chat_obj)
+                        resolved_user_id = chat_obj.id
+                        resolved_display = _get_username_display(chat_obj)
+                    except Exception:
+                        pass
                 break
 
-    # Also support reply-based adding: !add as reply to a user's message
-    if mentioned_user is None and message.reply_to_message:
-        mentioned_user = message.reply_to_message.from_user
+    # Support reply-based adding: !add as reply to a user's message
+    if resolved_user_id is None and message.reply_to_message and message.reply_to_message.from_user:
+        reply_user = message.reply_to_message.from_user
+        _cache_user(reply_user)
+        resolved_user_id = reply_user.id
+        resolved_display = _get_username_display(reply_user)
 
-    # Fallback: parse username from text if no entities matched
-    if mentioned_user is None:
+    # Fallback: parse username or user ID from text (no entity match)
+    if resolved_user_id is None:
         parts = text.split()
         if len(parts) >= 2:
-            username_raw = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
-            try:
-                chat_obj = await context.bot.get_chat(chat_id=username_raw)
-                mentioned_user = chat_obj
-            except Exception as e:
-                logger.warning("Could not resolve %s via get_chat: %s", username_raw, e)
+            arg = parts[1].strip()
+            if arg.isdigit():
+                # Numeric user ID — resolve via get_chat_member
+                try:
+                    member = await context.bot.get_chat_member(
+                        chat_id=MONITORED_GROUP_ID,
+                        user_id=int(arg),
+                    )
+                    _cache_user(member.user)
+                    resolved_user_id = member.user.id
+                    resolved_display = _get_username_display(member.user)
+                except Exception as e:
+                    logger.warning("Could not resolve user ID %s: %s", arg, e)
+            else:
+                # Username — look up in cache
+                username_raw = arg.lstrip("@").lower()
+                cached = _username_cache.get(username_raw)
+                if cached:
+                    resolved_user_id = cached["user_id"]
+                    resolved_display = f"@{cached['username']}"
 
-    if mentioned_user is None:
+    if resolved_user_id is None:
         await message.reply_text(
-            "Could not resolve the user. Please make sure the username is correct, "
-            "or reply to a message from that user with <b>!add</b>.",
+            "Could not resolve the user. Make sure the username or user ID is correct.\n\n"
+            "You can also reply to a message from that user with <b>!add</b>.",
             parse_mode="HTML",
         )
         return
 
-    # We have the user object — add them to tracking
-    new_member_display = _get_username_display(mentioned_user)
+    new_member_display = resolved_display or f"User {resolved_user_id}"
     adder_display = _get_username_display(sender)
     group_chat_id = chat.id
 
     # Store in member info
     _store_member_info(
-        new_member_id=mentioned_user.id,
+        new_member_id=resolved_user_id,
         group_chat_id=group_chat_id,
         hours=1,
         new_member_display=new_member_display,
@@ -721,7 +788,7 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Schedule security check after 1 hour
     await schedule_security_check(
         context,
-        new_member_id=mentioned_user.id,
+        new_member_id=resolved_user_id,
         group_chat_id=group_chat_id,
         hours=1,
         new_member_display=new_member_display,
@@ -730,13 +797,20 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     await message.reply_text(
-        f"{new_member_display} (<code>{mentioned_user.id}</code>) has been manually added to tracking by {adder_display}.",
+        f"{new_member_display} (<code>{resolved_user_id}</code>) has been manually added to tracking by {adder_display}.",
         parse_mode="HTML",
     )
     logger.info(
         "Known member %s manually added %s (%s) to tracking",
-        sender.id, mentioned_user.id, new_member_display,
+        sender.id, resolved_user_id, new_member_display,
     )
+
+
+async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Silently cache the sender's username from any message in the monitored group."""
+    user = update.effective_user
+    if user:
+        _cache_user(user)
 
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -790,6 +864,11 @@ def main() -> None:
     # !add @username handler for known members to manually track users
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!add"), handle_add_command)
+    )
+
+    # Catch-all handler to cache usernames from all messages in the monitored group
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Chat(chat_id=MONITORED_GROUP_ID), _cache_message_user)
     )
 
     logger.info("Bot started — monitoring group activity...")

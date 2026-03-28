@@ -84,6 +84,7 @@ def _store_member_info(
     hours: int,
     new_member_display: str,
     added_by_display: str,
+    adder_id: int = 0,
 ) -> None:
     """Store member display info in memory for callback lookups."""
     key = f"{new_member_id}:{group_chat_id}"
@@ -91,6 +92,7 @@ def _store_member_info(
         "member_disp": new_member_display,
         "adder_disp": added_by_display,
         "hours": hours,
+        "adder_id": adder_id,
     }
 
 
@@ -100,11 +102,13 @@ def _build_security_keyboard(
     hours: int,
     new_member_display: str,
     added_by_display: str,
+    adder_id: int = 0,
 ) -> InlineKeyboardMarkup:
     """Build inline keyboard for the security protocol message."""
     # Store display info in memory so callback data stays under 64 bytes
     _store_member_info(
-        new_member_id, group_chat_id, hours, new_member_display, added_by_display
+        new_member_id, group_chat_id, hours, new_member_display, added_by_display,
+        adder_id=adder_id,
     )
     # Compact callback data: "d:member_id:group_id" for deal, "k:member_id:group_id" for kick
     callback_data_deal = f"d:{new_member_id}:{group_chat_id}"
@@ -124,12 +128,14 @@ async def send_security_check(
     new_member_display: str,
     added_by_display: str,
     target_chat_id: int | None = None,
+    adder_id: int = 0,
 ) -> None:
     """Send security protocol message and schedule auto-kick."""
     send_to = target_chat_id or int(SECURITY_CHANNEL_ID)
     message_text = _build_security_message(new_member_display, added_by_display, hours)
     keyboard = _build_security_keyboard(
-        new_member_id, group_chat_id, hours, new_member_display, added_by_display
+        new_member_id, group_chat_id, hours, new_member_display, added_by_display,
+        adder_id=adder_id,
     )
 
     try:
@@ -175,6 +181,7 @@ async def schedule_security_check(
     hours: int,
     new_member_display: str,
     added_by_display: str,
+    adder_id: int = 0,
 ) -> None:
     """Schedule the first (or next) security check after SECURITY_CHECK_INTERVAL."""
     job_name = f"security_{new_member_id}_{group_chat_id}"
@@ -193,6 +200,7 @@ async def schedule_security_check(
             "hours": hours,
             "member_disp": new_member_display,
             "adder_disp": added_by_display,
+            "adder_id": adder_id,
         },
     )
     logger.info(
@@ -213,6 +221,7 @@ async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         hours=data["hours"],
         new_member_display=data["member_disp"],
         added_by_display=data["adder_disp"],
+        adder_id=data.get("adder_id", 0),
     )
 
 
@@ -258,6 +267,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     group_id = int(parts[2])
     info_key = f"{member_id}:{group_id}"
 
+    # Only the known member who added this person can use the buttons
+    info = _member_info.get(info_key, {})
+    adder_id = int(info.get("adder_id", 0))
+    if adder_id and query.from_user.id != adder_id:
+        await query.answer("Only the person who added this member can use this button.", show_alert=True)
+        return
+
     if action == "k":
         # Cancel the auto-kick job
         job_name = f"autokick_{member_id}_{group_id}"
@@ -288,6 +304,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         hours = int(info.get("hours", 1))
         new_member_display = str(info.get("member_disp", "Unknown"))
         added_by_display = str(info.get("adder_disp", "Unknown"))
+        stored_adder_id = int(info.get("adder_id", 0))
 
         # Cancel the auto-kick job
         job_name = f"autokick_{member_id}_{group_id}"
@@ -306,6 +323,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             hours=hours + 1,
             new_member_display=new_member_display,
             added_by_display=added_by_display,
+            adder_id=stored_adder_id,
         )
 
 
@@ -362,6 +380,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             hours=1,
             new_member_display=new_member_display,
             added_by_display=added_by_display,
+            adder_id=added_by.id,
         )
     else:
         # Unknown person added someone — alert

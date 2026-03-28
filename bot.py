@@ -11,6 +11,8 @@ from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # Logging setup
@@ -639,6 +641,92 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error("Failed to send unknown members list: %s", e)
 
 
+async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !add @username — lets known members manually add users to tracking."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!add"):
+        return
+
+    # Only known members can use this command
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    # Only works in the monitored group
+    chat = update.effective_chat
+    if not chat or chat.id != MONITORED_GROUP_ID:
+        return
+
+    # Extract mentioned user from entities
+    mentioned_user = None
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "text_mention":
+                # User without a username — entity contains user object
+                mentioned_user = entity.user
+                break
+            elif entity.type == "mention":
+                # User has a username — extract it from text
+                username_text = message.text[entity.offset:entity.offset + entity.length]
+                # We can't resolve username to user_id via Telegram API without the user object
+                # So we'll store what we have
+                mentioned_user = None
+                # Try to get user from reply or context
+                break
+
+    # Also support reply-based adding: !add as reply to a user's message
+    if mentioned_user is None and message.reply_to_message:
+        mentioned_user = message.reply_to_message.from_user
+
+    # If we still don't have the user, inform the sender
+    if mentioned_user is None:
+        await message.reply_text(
+            "Usage: Reply to a user's message with <b>!add</b>, "
+            "or mention the user by tapping their name (not just typing @username).",
+            parse_mode="HTML",
+        )
+        return
+
+    # We have the user object — add them to tracking
+    new_member_display = _get_username_display(mentioned_user)
+    adder_display = _get_username_display(sender)
+    group_chat_id = chat.id
+
+    # Store in member info
+    _store_member_info(
+        new_member_id=mentioned_user.id,
+        group_chat_id=group_chat_id,
+        hours=1,
+        new_member_display=new_member_display,
+        added_by_display=adder_display,
+        adder_id=sender.id,
+    )
+
+    # Schedule security check after 1 hour
+    await schedule_security_check(
+        context,
+        new_member_id=mentioned_user.id,
+        group_chat_id=group_chat_id,
+        hours=1,
+        new_member_display=new_member_display,
+        added_by_display=adder_display,
+        adder_id=sender.id,
+    )
+
+    await message.reply_text(
+        f"{new_member_display} (<code>{mentioned_user.id}</code>) has been manually added to tracking by {adder_display}.",
+        parse_mode="HTML",
+    )
+    logger.info(
+        "Known member %s manually added %s (%s) to tracking",
+        sender.id, mentioned_user.id, new_member_display,
+    )
+
+
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a test security protocol message to the chat where /test is used."""
     test_member_display = "@test_member"
@@ -686,6 +774,11 @@ def main() -> None:
 
     # /unklist command to list unknown members in the monitored group
     application.add_handler(CommandHandler("unklist", unklist_command))
+
+    # !add @username handler for known members to manually track users
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!add"), handle_add_command)
+    )
 
     logger.info("Bot started — monitoring group activity...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

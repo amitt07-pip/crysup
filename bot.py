@@ -2,6 +2,7 @@ import json
 import os
 import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ChatMember
 from telegram.ext import (
@@ -47,9 +48,42 @@ AUTO_KICK_TIMEOUT = 30 * 60
 # Security check interval in seconds (1 hour)
 SECURITY_CHECK_INTERVAL = 60 * 60
 
-# In-memory store for member display info (keyed by "member_id:group_id")
+# Persistent store for member display info (keyed by "member_id:group_id")
 # Used to keep callback data under Telegram's 64-byte limit
-_member_info: dict[str, dict[str, str | int]] = {}
+_DATA_FILE = Path(__file__).parent / "member_data.json"
+_member_info: dict[str, dict] = {}
+
+
+def _save_data() -> None:
+    """Persist _member_info to disk."""
+    serializable = {}
+    for key, val in _member_info.items():
+        entry = dict(val)
+        # Convert datetime to ISO string for JSON
+        if isinstance(entry.get("added_at"), datetime):
+            entry["added_at"] = entry["added_at"].isoformat()
+        serializable[key] = entry
+    try:
+        _DATA_FILE.write_text(json.dumps(serializable, indent=2))
+    except Exception as e:
+        logger.error("Failed to save member data: %s", e)
+
+
+def _load_data() -> None:
+    """Load _member_info from disk on startup."""
+    global _member_info
+    if not _DATA_FILE.exists():
+        return
+    try:
+        raw = json.loads(_DATA_FILE.read_text())
+        for key, val in raw.items():
+            # Convert ISO string back to datetime
+            if isinstance(val.get("added_at"), str):
+                val["added_at"] = datetime.fromisoformat(val["added_at"])
+            _member_info[key] = val
+        logger.info("Loaded %d member entries from disk", len(_member_info))
+    except Exception as e:
+        logger.error("Failed to load member data: %s", e)
 
 
 def _get_username_display(user) -> str:
@@ -96,7 +130,9 @@ def _store_member_info(
         "hours": hours,
         "adder_id": adder_id,
         "added_at": existing.get("added_at", datetime.now(timezone.utc)),
+        "12h_used": existing.get("12h_used", False),
     }
+    _save_data()
 
 
 def _build_security_keyboard(
@@ -116,9 +152,11 @@ def _build_security_keyboard(
     # Compact callback data: "d:member_id:group_id" for deal, "k:member_id:group_id" for kick
     callback_data_deal = f"d:{new_member_id}:{group_chat_id}"
     callback_data_kick = f"k:{new_member_id}:{group_chat_id}"
+    callback_data_12h = f"h:{new_member_id}:{group_chat_id}"
     keyboard = [
         [InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal)],
         [InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick)],
+        [InlineKeyboardButton("+12 Hours", callback_data=callback_data_12h)],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -269,14 +307,14 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline button presses on security protocol messages."""
     query = update.callback_query
-    await query.answer()
 
     raw = query.data or ""
     parts = raw.split(":")
     if len(parts) < 3:
+        await query.answer()
         return
 
-    action = parts[0]  # "d" for deal, "k" for kick
+    action = parts[0]  # "d" for deal, "k" for kick, "h" for +12h, "hy"/"hn" for confirm
     member_id = int(parts[1])
     group_id = int(parts[2])
     info_key = f"{member_id}:{group_id}"
@@ -287,6 +325,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if adder_id and query.from_user.id != adder_id:
         await query.answer("Only the person who added this member can use this button.", show_alert=True)
         return
+
+    # Check +12h one-time use before answering
+    if action == "h" and info.get("12h_used"):
+        await query.answer("The +12 Hours skip has already been used for this member.", show_alert=True)
+        return
+
+    await query.answer()
 
     if action == "k":
         # Cancel the auto-kick job
@@ -303,6 +348,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Clean up stored info
         _member_info.pop(info_key, None)
+        _save_data()
 
         try:
             await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
@@ -349,6 +395,104 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             new_member_display=new_member_display,
             added_by_display=added_by_display,
             adder_id=stored_adder_id,
+        )
+
+    elif action == "h":
+        # +12 Hours button — one-time use (already validated above)
+        info = _member_info.get(info_key, {})
+
+        # Send confirmation message with Yes/No buttons
+        confirm_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Yes", callback_data=f"hy:{member_id}:{group_id}")],
+            [InlineKeyboardButton("No", callback_data=f"hn:{member_id}:{group_id}")],
+        ])
+        # Store the original security message id for later editing
+        info["12h_orig_msg_id"] = query.message.message_id
+        info["12h_orig_chat_id"] = query.message.chat_id
+        _member_info[info_key] = info
+        _save_data()
+
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "<b>This button can be used only One-Time for night deals "
+                "or time taking deals, please confirm your decision.</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=confirm_keyboard,
+        )
+
+    elif action == "hy":
+        # Yes — confirm +12 Hours skip
+        info = _member_info.get(info_key, {})
+        new_member_display = str(info.get("member_disp", "Unknown"))
+        added_by_display = str(info.get("adder_disp", "Unknown"))
+        stored_adder_id = int(info.get("adder_id", 0))
+        hours = int(info.get("hours", 1))
+
+        # Mark as used
+        info["12h_used"] = True
+        _member_info[info_key] = info
+        _save_data()
+
+        # Cancel the auto-kick job
+        job_name = f"autokick_{member_id}_{group_id}"
+        existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+        for job in existing_jobs:
+            job.schedule_removal()
+
+        # Cancel any pending security check job
+        sec_job_name = f"security_{member_id}_{group_id}"
+        sec_jobs = context.job_queue.get_jobs_by_name(sec_job_name)
+        for job in sec_jobs:
+            job.schedule_removal()
+
+        # Edit the original security protocol message: keep text, remove buttons, add status
+        orig_msg_id = info.get("12h_orig_msg_id")
+        orig_chat_id = info.get("12h_orig_chat_id")
+        if orig_msg_id and orig_chat_id:
+            try:
+                orig_msg = await context.bot.edit_message_reply_markup(
+                    chat_id=orig_chat_id,
+                    message_id=orig_msg_id,
+                    reply_markup=None,
+                )
+                original_text = ""
+                if hasattr(orig_msg, "text_html") and orig_msg.text_html:
+                    original_text = orig_msg.text_html
+                elif hasattr(orig_msg, "text") and orig_msg.text:
+                    original_text = orig_msg.text
+                await context.bot.edit_message_text(
+                    chat_id=orig_chat_id,
+                    message_id=orig_msg_id,
+                    text=f"{original_text}\n\n<b>Status: Added 12 Hours Skip</b>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error("Failed to edit original security message for 12h skip: %s", e)
+
+        # Edit the confirmation message: remove buttons
+        await query.edit_message_text(
+            text="<b>+12 Hours skip confirmed.</b>",
+            parse_mode="HTML",
+        )
+
+        # Schedule next check in 12 hours
+        await schedule_security_check(
+            context,
+            new_member_id=member_id,
+            group_chat_id=group_id,
+            hours=hours + 12,
+            new_member_display=new_member_display,
+            added_by_display=added_by_display,
+            adder_id=stored_adder_id,
+        )
+
+    elif action == "hn":
+        # No — cancel +12 Hours skip, allow reuse
+        await query.edit_message_text(
+            text="<b>+12 Hours skip cancelled.</b>",
+            parse_mode="HTML",
         )
 
 
@@ -523,6 +667,9 @@ def main() -> None:
         logger.warning(
             "LOG_CHANNEL_ID is not set. The bot will run but won't send logs anywhere."
         )
+
+    # Load persisted member data from disk
+    _load_data()
 
     application = Application.builder().token(BOT_TOKEN).build()
 

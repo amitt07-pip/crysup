@@ -111,8 +111,10 @@ async def send_security_check(
     hours: int,
     new_member_display: str,
     added_by_display: str,
+    target_chat_id: int | None = None,
 ) -> None:
     """Send security protocol message and schedule auto-kick."""
+    send_to = target_chat_id or int(SECURITY_CHANNEL_ID)
     message_text = _build_security_message(new_member_display, added_by_display, hours)
     keyboard = _build_security_keyboard(
         new_member_id, group_chat_id, hours, new_member_display, added_by_display
@@ -120,7 +122,7 @@ async def send_security_check(
 
     try:
         sent_msg = await context.bot.send_message(
-            chat_id=int(SECURITY_CHANNEL_ID),
+            chat_id=send_to,
             text=message_text,
             parse_mode="HTML",
             reply_markup=keyboard,
@@ -147,6 +149,7 @@ async def send_security_check(
                 "member_id": new_member_id,
                 "group_id": group_chat_id,
                 "message_id": sent_msg.message_id,
+                "sent_chat_id": send_to,
             },
         )
     except Exception as e:
@@ -214,9 +217,10 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Auto-kicked member %s from group %s", member_id, group_id)
 
         # Edit the security message to indicate auto-kick
+        sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
         try:
             await context.bot.edit_message_text(
-                chat_id=int(SECURITY_CHANNEL_ID),
+                chat_id=sent_chat_id,
                 message_id=message_id,
                 text="⚠️ Member was auto-kicked due to no response within 30 minutes.",
             )
@@ -375,8 +379,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a test security protocol message for debugging."""
-    # Use dummy data for testing
+    """Send a test security protocol message to the chat where /test is used."""
     test_member_display = "@test_member"
     test_adder_display = "@test_adder"
     test_member_id = 123456789
@@ -389,6 +392,7 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         hours=1,
         new_member_display=test_member_display,
         added_by_display=test_adder_display,
+        target_chat_id=update.effective_chat.id,
     )
     await update.message.reply_text("Test security protocol message sent!")
 

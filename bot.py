@@ -338,6 +338,10 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if result is None:
         return
 
+    # Only monitor the specific group
+    if result.chat.id != MONITORED_GROUP_ID:
+        return
+
     old_status = result.old_chat_member.status
     new_status = result.new_chat_member.status
 

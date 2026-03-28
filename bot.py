@@ -558,8 +558,32 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ChatMember.OWNER,
     )
 
-    if was_member or not is_member:
-        # Not a new addition — ignore
+    # Detect member leaving: was a member, now is NOT a member
+    if was_member and not is_member:
+        left_user = result.new_chat_member.user
+        _cache_user(left_user)
+        info_key = f"{left_user.id}:{result.chat.id}"
+        if info_key in _member_info:
+            # Cancel security check job
+            sec_job_name = f"security_{left_user.id}_{result.chat.id}"
+            sec_jobs = context.job_queue.get_jobs_by_name(sec_job_name)
+            for job in sec_jobs:
+                job.schedule_removal()
+            # Cancel auto-kick job
+            kick_job_name = f"autokick_{left_user.id}_{result.chat.id}"
+            kick_jobs = context.job_queue.get_jobs_by_name(kick_job_name)
+            for job in kick_jobs:
+                job.schedule_removal()
+            # Remove from tracking
+            _member_info.pop(info_key, None)
+            _save_data()
+            left_display = _get_username_display(left_user)
+            logger.info("Tracked member %s (%s) left the group — removed from tracking",
+                        left_user.id, left_display)
+        return
+
+    if not (not was_member and is_member):
+        # Not a new addition and not a leave — ignore
         return
 
     new_member = result.new_chat_member.user

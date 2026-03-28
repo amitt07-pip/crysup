@@ -85,16 +85,16 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if added_by.id in KNOWN_MEMBER_IDS:
         # Known member added someone — friendly log
         log_message = (
-            f"~ {new_member_display} has been added by "
-            f"{added_by_display} in the CryptoIndia Group ‼️"
+            f"~ {new_member_display} (<code>{new_member.id}</code>) has been added by "
+            f"{added_by_display} (<code>{added_by.id}</code>) in the CryptoIndia Group ‼️"
         )
     else:
         # Unknown person added someone — alert
         log_message = (
             f"🚨 <b>MEMBER ADDED BY A UNKNOWN PERSON</b> ‼️\n"
             f"\n"
-            f"Username - {new_member_display} {new_member.id}\n"
-            f"Added by - {added_by_display} {added_by.id}\n"
+            f"Username - {new_member_display} (<code>{new_member.id}</code>)\n"
+            f"Added by - {added_by_display} (<code>{added_by.id}</code>)\n"
             f"Date - {formatted_time}\n"
             f"\n"
             f"If it is not done by any of the group members "

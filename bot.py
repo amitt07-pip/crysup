@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 SECURITY_CHANNEL_ID = "-1002215462357"
+MONITORED_GROUP_ID = -1003446573761
 
 # Known member user IDs — additions by these users are considered trusted
 KNOWN_MEMBER_IDS = {
@@ -413,6 +414,48 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.error("Failed to send log message: %s", e)
 
 
+async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List unknown members still in the monitored group and send to security channel."""
+    try:
+        tracked_keys = list(_member_info.keys())
+        if not tracked_keys:
+            await context.bot.send_message(
+                chat_id=int(SECURITY_CHANNEL_ID),
+                text="📋 <b>Unknown Members List</b>\n\nNo tracked unknown members currently in the group.",
+                parse_mode="HTML",
+            )
+            await update.message.reply_text("Unknown members list sent to security channel.")
+            return
+
+        lines = []
+        for key in tracked_keys:
+            info = _member_info[key]
+            member_disp = info.get("member_disp", "Unknown")
+            adder_disp = info.get("adder_disp", "Unknown")
+            parts = key.split(":")
+            member_id = parts[0]
+            lines.append(
+                f"• {member_disp} (<code>{member_id}</code>) — added by {adder_disp}"
+            )
+
+        member_list = "\n".join(lines)
+        message_text = (
+            f"📋 <b>Tracked Members List</b>\n\n"
+            f"{member_list}\n\n"
+            f"Total: {len(lines)} member(s) with active security checks."
+        )
+
+        await context.bot.send_message(
+            chat_id=int(SECURITY_CHANNEL_ID),
+            text=message_text,
+            parse_mode="HTML",
+        )
+        await update.message.reply_text("Unknown members list sent to security channel.")
+    except Exception as e:
+        logger.error("Failed to send unknown members list: %s", e)
+        await update.message.reply_text(f"Failed to get member list: {e}")
+
+
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a test security protocol message to the chat where /test is used."""
     test_member_display = "@test_member"
@@ -455,6 +498,9 @@ def main() -> None:
 
     # /test command for testing security protocol
     application.add_handler(CommandHandler("test", test_command))
+
+    # /unklist command to list unknown members in the monitored group
+    application.add_handler(CommandHandler("unklist", unklist_command))
 
     logger.info("Bot started — monitoring group activity...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

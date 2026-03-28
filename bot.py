@@ -670,23 +670,35 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 mentioned_user = entity.user
                 break
             elif entity.type == "mention":
-                # User has a username — extract it from text
+                # User has a @username — resolve via get_chat
                 username_text = message.text[entity.offset:entity.offset + entity.length]
-                # We can't resolve username to user_id via Telegram API without the user object
-                # So we'll store what we have
-                mentioned_user = None
-                # Try to get user from reply or context
+                try:
+                    chat_obj = await context.bot.get_chat(chat_id=username_text)
+                    # Create a minimal user-like object from the Chat object
+                    mentioned_user = chat_obj
+                except Exception as e:
+                    logger.warning("Could not resolve %s via get_chat: %s", username_text, e)
                 break
 
     # Also support reply-based adding: !add as reply to a user's message
     if mentioned_user is None and message.reply_to_message:
         mentioned_user = message.reply_to_message.from_user
 
-    # If we still don't have the user, inform the sender
+    # Fallback: parse username from text if no entities matched
+    if mentioned_user is None:
+        parts = text.split()
+        if len(parts) >= 2:
+            username_raw = parts[1] if parts[1].startswith("@") else f"@{parts[1]}"
+            try:
+                chat_obj = await context.bot.get_chat(chat_id=username_raw)
+                mentioned_user = chat_obj
+            except Exception as e:
+                logger.warning("Could not resolve %s via get_chat: %s", username_raw, e)
+
     if mentioned_user is None:
         await message.reply_text(
-            "Usage: Reply to a user's message with <b>!add</b>, "
-            "or mention the user by tapping their name (not just typing @username).",
+            "Could not resolve the user. Please make sure the username is correct, "
+            "or reply to a message from that user with <b>!add</b>.",
             parse_mode="HTML",
         )
         return

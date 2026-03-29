@@ -1088,6 +1088,45 @@ async def handle_demote_command(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info("Known member %s demoted %s (%s) from known member", sender.id, resolved_user_id, display)
 
 
+async def handle_refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !refresh — check all tracked members and remove those no longer in the group."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!refresh"):
+        return
+
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    # Iterate over all tracked members and check if they're still in the group
+    keys_to_remove: list[tuple[int, int]] = []
+    for key in list(_member_info.keys()):
+        parts = key.split(":")
+        if len(parts) != 2:
+            continue
+        member_id = int(parts[0])
+        group_id = int(parts[1])
+        if not await _is_member_in_group(context.bot, member_id, group_id):
+            keys_to_remove.append((member_id, group_id))
+
+    removed_count = 0
+    for member_id, group_id in keys_to_remove:
+        _cleanup_tracked_member(member_id, group_id, context)
+        removed_count += 1
+
+    total_remaining = len(_member_info)
+    await message.reply_text(
+        f"Refreshed tracking list. Removed <b>{removed_count}</b> member(s) no longer in the group.\n"
+        f"Currently tracking <b>{total_remaining}</b> member(s).",
+        parse_mode="HTML",
+    )
+    logger.info("Refresh by %s: removed %d, remaining %d", sender.id, removed_count, total_remaining)
+
+
 async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently cache the sender's username from any message in the monitored group."""
     user = update.effective_user
@@ -1172,6 +1211,11 @@ def main() -> None:
     # !demote @username handler for known members to remove users from known members
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!demote"), handle_demote_command)
+    )
+
+    # !refresh handler for known members to refresh the tracking list
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!refresh"), handle_refresh_command)
     )
 
     # Catch-all handler to cache usernames from all messages in the monitored group

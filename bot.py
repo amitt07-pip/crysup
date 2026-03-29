@@ -285,13 +285,53 @@ async def schedule_security_check(
     )
 
 
+async def _is_member_in_group(bot, member_id: int, group_id: int) -> bool:
+    """Check if a user is still a member of the group."""
+    try:
+        chat_member = await bot.get_chat_member(chat_id=group_id, user_id=member_id)
+        return chat_member.status in (
+            ChatMember.MEMBER,
+            ChatMember.ADMINISTRATOR,
+            ChatMember.OWNER,
+            ChatMember.RESTRICTED,
+        )
+    except Exception as e:
+        logger.warning("Could not check membership for %s in %s: %s", member_id, group_id, e)
+        return False
+
+
+def _cleanup_tracked_member(member_id: int, group_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a tracked member from storage and cancel their jobs."""
+    info_key = f"{member_id}:{group_id}"
+    if info_key in _member_info:
+        _member_info.pop(info_key, None)
+        _save_data()
+    # Cancel security check job
+    sec_jobs = context.job_queue.get_jobs_by_name(f"security_{member_id}_{group_id}")
+    for job in sec_jobs:
+        job.schedule_removal()
+    # Cancel auto-kick job
+    kick_jobs = context.job_queue.get_jobs_by_name(f"autokick_{member_id}_{group_id}")
+    for job in kick_jobs:
+        job.schedule_removal()
+    logger.info("Cleaned up tracking for member %s in group %s (no longer in group)", member_id, group_id)
+
+
 async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job callback that sends the security check message."""
     data = context.job.data
+    member_id = data["member_id"]
+    group_id = data["group_id"]
+
+    # Verify member is still in the group before sending protocol message
+    if not await _is_member_in_group(context.bot, member_id, group_id):
+        _cleanup_tracked_member(member_id, group_id, context)
+        return
+
     await send_security_check(
         context,
-        new_member_id=data["member_id"],
-        group_chat_id=data["group_id"],
+        new_member_id=member_id,
+        group_chat_id=group_id,
         hours=data["hours"],
         new_member_display=data["member_disp"],
         added_by_display=data["adder_disp"],
@@ -305,6 +345,32 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
     member_id = data["member_id"]
     group_id = data["group_id"]
     message_id = data["message_id"]
+
+    # Verify member is still in the group before auto-kicking
+    if not await _is_member_in_group(context.bot, member_id, group_id):
+        _cleanup_tracked_member(member_id, group_id, context)
+        # Edit message to show they already left
+        sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
+        try:
+            msg = await context.bot.edit_message_reply_markup(
+                chat_id=sent_chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+            original_text = ""
+            if hasattr(msg, "text_html") and msg.text_html:
+                original_text = msg.text_html
+            elif hasattr(msg, "text") and msg.text:
+                original_text = msg.text
+            await context.bot.edit_message_text(
+                chat_id=sent_chat_id,
+                message_id=message_id,
+                text=f"{original_text}\n\nStatus: Member already left the group",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Failed to edit message for departed member: %s", e)
+        return
 
     try:
         await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
@@ -564,22 +630,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         _cache_user(left_user)
         info_key = f"{left_user.id}:{result.chat.id}"
         if info_key in _member_info:
-            # Cancel security check job
-            sec_job_name = f"security_{left_user.id}_{result.chat.id}"
-            sec_jobs = context.job_queue.get_jobs_by_name(sec_job_name)
-            for job in sec_jobs:
-                job.schedule_removal()
-            # Cancel auto-kick job
-            kick_job_name = f"autokick_{left_user.id}_{result.chat.id}"
-            kick_jobs = context.job_queue.get_jobs_by_name(kick_job_name)
-            for job in kick_jobs:
-                job.schedule_removal()
-            # Remove from tracking
-            _member_info.pop(info_key, None)
-            _save_data()
-            left_display = _get_username_display(left_user)
-            logger.info("Tracked member %s (%s) left the group — removed from tracking",
-                        left_user.id, left_display)
+            _cleanup_tracked_member(left_user.id, result.chat.id, context)
         return
 
     if not (not was_member and is_member):

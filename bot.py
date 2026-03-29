@@ -58,9 +58,12 @@ _member_info: dict[str, dict] = {}
 # Username cache: lowercase username -> {"user_id": int, "first_name": str, "username": str}
 _username_cache: dict[str, dict] = {}
 
+# Dynamic known members added via !allow (persisted to JSON)
+_dynamic_known: set[int] = set()
+
 
 def _save_data() -> None:
-    """Persist _member_info and _username_cache to disk."""
+    """Persist _member_info, _username_cache, and _dynamic_known to disk."""
     serializable_members = {}
     for key, val in _member_info.items():
         entry = dict(val)
@@ -72,6 +75,7 @@ def _save_data() -> None:
         data = {
             "members": serializable_members,
             "username_cache": _username_cache,
+            "dynamic_known": list(_dynamic_known),
         }
         _DATA_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -79,8 +83,8 @@ def _save_data() -> None:
 
 
 def _load_data() -> None:
-    """Load _member_info and _username_cache from disk on startup."""
-    global _member_info, _username_cache
+    """Load _member_info, _username_cache, and _dynamic_known from disk on startup."""
+    global _member_info, _username_cache, _dynamic_known
     if not _DATA_FILE.exists():
         return
     try:
@@ -89,6 +93,7 @@ def _load_data() -> None:
         if "members" in raw and isinstance(raw["members"], dict):
             members_raw = raw["members"]
             _username_cache = raw.get("username_cache", {})
+            _dynamic_known = set(raw.get("dynamic_known", []))
         else:
             # Old format: raw is the member dict directly
             members_raw = raw
@@ -97,8 +102,10 @@ def _load_data() -> None:
             if isinstance(val.get("added_at"), str):
                 val["added_at"] = datetime.fromisoformat(val["added_at"])
             _member_info[key] = val
-        logger.info("Loaded %d member entries, %d cached usernames from disk",
-                    len(_member_info), len(_username_cache))
+        # Merge dynamic known members into the working set
+        KNOWN_MEMBER_IDS.update(_dynamic_known)
+        logger.info("Loaded %d member entries, %d cached usernames, %d dynamic known from disk",
+                    len(_member_info), len(_username_cache), len(_dynamic_known))
     except Exception as e:
         logger.error("Failed to load member data: %s", e)
 
@@ -972,6 +979,115 @@ async def handle_12hr_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def handle_allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !allow @username/user_id — lets known members promote someone to known member."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!allow"):
+        return
+
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    _cache_user(sender)
+
+    resolved_user_id, resolved_display = await _resolve_user(message, text, context)
+
+    if resolved_user_id is None:
+        await message.reply_text(
+            "Could not resolve the user. Make sure the username or user ID is correct.\n\n"
+            "You can also reply to a message from that user with <b>!allow</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    display = resolved_display or f"User {resolved_user_id}"
+
+    if resolved_user_id in KNOWN_MEMBER_IDS:
+        await message.reply_text(
+            f"{display} (<code>{resolved_user_id}</code>) is already a known member.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Add to known members
+    KNOWN_MEMBER_IDS.add(resolved_user_id)
+    _dynamic_known.add(resolved_user_id)
+    _save_data()
+
+    # If they were being tracked, clean up their tracking
+    info_key = f"{resolved_user_id}:{MONITORED_GROUP_ID}"
+    if info_key in _member_info:
+        _cleanup_tracked_member(resolved_user_id, MONITORED_GROUP_ID, context)
+
+    adder_display = _get_username_display(sender)
+    await message.reply_text(
+        f"{display} (<code>{resolved_user_id}</code>) has been added to known members by {adder_display}.",
+        parse_mode="HTML",
+    )
+    logger.info("Known member %s promoted %s (%s) to known member", sender.id, resolved_user_id, display)
+
+
+async def handle_demote_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !demote @username/user_id — lets known members remove someone from known members."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!demote"):
+        return
+
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    _cache_user(sender)
+
+    resolved_user_id, resolved_display = await _resolve_user(message, text, context)
+
+    if resolved_user_id is None:
+        await message.reply_text(
+            "Could not resolve the user. Make sure the username or user ID is correct.\n\n"
+            "You can also reply to a message from that user with <b>!demote</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    display = resolved_display or f"User {resolved_user_id}"
+
+    if resolved_user_id not in _dynamic_known:
+        await message.reply_text(
+            f"{display} (<code>{resolved_user_id}</code>) is not a dynamically added known member (only !allow'd members can be demoted).",
+            parse_mode="HTML",
+        )
+        return
+
+    # Remove from known members
+    KNOWN_MEMBER_IDS.discard(resolved_user_id)
+    _dynamic_known.discard(resolved_user_id)
+    _save_data()
+
+    adder_display = _get_username_display(sender)
+    await message.reply_text(
+        f"{display} (<code>{resolved_user_id}</code>) has been removed from known members by {adder_display}.",
+        parse_mode="HTML",
+    )
+    logger.info("Known member %s demoted %s (%s) from known member", sender.id, resolved_user_id, display)
+
+
 async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently cache the sender's username from any message in the monitored group."""
     user = update.effective_user
@@ -984,17 +1100,28 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     test_member_display = "@test_member"
     test_adder_display = "@test_adder"
     test_member_id = 123456789
-    test_group_id = update.effective_chat.id
+    test_chat_id = update.effective_chat.id
 
-    await send_security_check(
-        context,
-        new_member_id=test_member_id,
-        group_chat_id=test_group_id,
-        hours=1,
-        new_member_display=test_member_display,
-        added_by_display=test_adder_display,
-        target_chat_id=update.effective_chat.id,
-    )
+    # Build message and keyboard without storing in _member_info
+    message_text = _build_security_message(test_member_display, test_adder_display, 1)
+    callback_data_deal = f"d:{test_member_id}:{test_chat_id}"
+    callback_data_kick = f"k:{test_member_id}:{test_chat_id}"
+    callback_data_12h = f"h:{test_member_id}:{test_chat_id}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal)],
+        [InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick)],
+        [InlineKeyboardButton("+12 Hours", callback_data=callback_data_12h)],
+    ])
+
+    try:
+        await context.bot.send_message(
+            chat_id=test_chat_id,
+            text=message_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.error("Failed to send test security message: %s", e)
 
 
 def main() -> None:
@@ -1035,6 +1162,16 @@ def main() -> None:
     # !12hr @username handler for known members to manually apply 12h skip
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!12hr"), handle_12hr_command)
+    )
+
+    # !allow @username handler for known members to promote users to known members
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!allow"), handle_allow_command)
+    )
+
+    # !demote @username handler for known members to remove users from known members
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!demote"), handle_demote_command)
     )
 
     # Catch-all handler to cache usernames from all messages in the monitored group

@@ -1230,6 +1230,68 @@ async def handle_restart_command(update: Update, context: ContextTypes.DEFAULT_T
     logger.info("Restart by %s: cleared %d tracked members", sender.id, cleared_count)
 
 
+async def knlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all known members and send to the security channel."""
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    try:
+        # Build reverse lookup from username cache: user_id -> display name
+        id_to_display: dict[int, str] = {}
+        for _uname, info in _username_cache.items():
+            uid = info.get("user_id")
+            if uid:
+                username = info.get("username", "")
+                first_name = info.get("first_name", "")
+                if username:
+                    id_to_display[uid] = f"@{username}"
+                elif first_name:
+                    id_to_display[uid] = first_name
+
+        # Hardcoded known members
+        static_ids = {
+            1166772148, 1870644348, 5651721135, 5662585948,
+            6526824979, 6659288294, 6864194951, 7001100331,
+            7090417167, 7279906688, 7338429782, 7422906767,
+            7707071842, 7715451354,
+        }
+
+        static_lines = []
+        for uid in sorted(static_ids):
+            display = id_to_display.get(uid, "Unknown")
+            static_lines.append(f"\u2022 {display} (<code>{uid}</code>)")
+
+        dynamic_lines = []
+        for uid in sorted(_dynamic_known):
+            display = id_to_display.get(uid, "Unknown")
+            dynamic_lines.append(f"\u2022 {display} (<code>{uid}</code>)")
+
+        sections = []
+        sections.append(
+            f"\ud83d\udd12 <b>Static Known Members ({len(static_lines)})</b>\n" + "\n".join(static_lines)
+        )
+        if dynamic_lines:
+            sections.append(
+                f"\u2795 <b>Dynamically Added Members ({len(dynamic_lines)})</b>\n" + "\n".join(dynamic_lines)
+            )
+
+        total = len(static_ids) + len(_dynamic_known)
+        message_text = (
+            f"\ud83d\udccb <b>Known Members List</b>\n\n"
+            + "\n\n".join(sections)
+            + f"\n\nTotal: {total} known member(s)."
+        )
+
+        await context.bot.send_message(
+            chat_id=int(SECURITY_CHANNEL_ID),
+            text=message_text,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Failed to send known members list: %s", e)
+
+
 async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently cache the sender's username from any message in the monitored group."""
     user = update.effective_user
@@ -1295,6 +1357,9 @@ def main() -> None:
 
     # /unklist command to list unknown members in the monitored group
     application.add_handler(CommandHandler("unklist", unklist_command))
+
+    # /knlist command to list known members
+    application.add_handler(CommandHandler("knlist", knlist_command))
 
     # !add @username handler for known members to manually track users
     application.add_handler(

@@ -17,10 +17,15 @@ from telegram.ext import (
 
 # Logging setup
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+# Suppress noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext._updater").setLevel(logging.WARNING)
+logger = logging.getLogger("CrySup")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
@@ -1333,12 +1338,11 @@ async def handle_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not message or not message.text:
         return
 
-    text = message.text.strip()
-    if not text.lower().startswith("!help"):
-        return
-
     sender = update.effective_user
+    logger.info("!help triggered by user %s (id=%s)", sender.full_name if sender else "?", sender.id if sender else "?")
+
     if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        logger.warning("!help denied: user %s not in known members", sender.id if sender else "?")
         return
 
     help_text = _build_help_main_text()
@@ -1350,6 +1354,7 @@ async def handle_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="HTML",
             reply_markup=keyboard,
         )
+        logger.info("!help menu sent successfully")
     except Exception as e:
         logger.error("Failed to send help message: %s", e)
 
@@ -1360,12 +1365,11 @@ async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not message or not message.text:
         return
 
-    text_cmd = message.text.strip()
-    if not text_cmd.lower().startswith("!knlist"):
-        return
-
     sender = update.effective_user
+    logger.info("!knlist triggered by user %s (id=%s)", sender.full_name if sender else "?", sender.id if sender else "?")
+
     if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        logger.warning("!knlist denied: user %s not in known members", sender.id if sender else "?")
         return
 
     try:
@@ -1420,6 +1424,7 @@ async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TY
             text=message_text,
             parse_mode="HTML",
         )
+        logger.info("!knlist sent to security channel")
     except Exception as e:
         logger.error("Failed to send known members list: %s", e)
 
@@ -1537,7 +1542,20 @@ def main() -> None:
         group=1,
     )
 
-    logger.info("Bot started — monitoring group activity...")
+    # Error handler for uncaught exceptions
+    async def error_handler(update, context):
+        logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
+
+    application.add_error_handler(error_handler)
+
+    logger.info("\u2500" * 40)
+    logger.info("CrySup Security Bot started")
+    logger.info("Monitored group: %s", MONITORED_GROUP_ID)
+    logger.info("Log channel: %s", LOG_CHANNEL_ID)
+    logger.info("Security channel: %s", SECURITY_CHANNEL_ID)
+    logger.info("Known members: %d static + %d dynamic", len(KNOWN_MEMBER_IDS) - len(_dynamic_known), len(_dynamic_known))
+    logger.info("Tracked members: %d", len(_member_info))
+    logger.info("\u2500" * 40)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

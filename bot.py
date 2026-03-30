@@ -1245,8 +1245,8 @@ async def _handle_help_callback(query, category: str) -> None:
             "\ud83d\udcd6 <b>Slash Commands</b>\n\n"
             "\u2022 <code>/test</code> \u2014 Send a sample security protocol message to the current chat for testing.\n\n"
             "\u2022 <code>/unklist</code> \u2014 List all tracked members split by known/unknown adder. Sent to the security channel.\n\n"
-            "\u2022 <code>/knlist</code> \u2014 List all known members (static + dynamically added). Sent to the security channel.\n\n"
-            "\u2022 <code>/help</code> \u2014 Show this help menu."
+            "\u2022 <code>!knlist</code> \u2014 List all known members (static + dynamically added). Sent to the security channel.\n\n"
+            "\u2022 <code>!help</code> \u2014 Show this help menu."
         )
     elif category == "member":
         text = (
@@ -1265,6 +1265,7 @@ async def _handle_help_callback(query, category: str) -> None:
             "\ud83d\udee0\ufe0f <b>Bot Tools</b>\n\n"
             "\u2022 <code>!refresh</code> \u2014 Check all tracked members' group membership and remove anyone who has left.\n\n"
             "\u2022 <code>!restart</code> \u2014 Clear all tracked members and cancel all pending timers. Starts from zero.\n\n"
+            "\u2022 <code>!knlist</code> \u2014 List all known members.\n\n"
             "\u2022 <code>!help</code> \u2014 Show this help menu."
         )
     elif category == "auto":
@@ -1353,8 +1354,16 @@ async def handle_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error("Failed to send help message: %s", e)
 
 
-async def knlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all known members and send to the security channel."""
+async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !knlist — list all known members and send to the security channel."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text_cmd = message.text.strip()
+    if not text_cmd.lower().startswith("!knlist"):
+        return
+
     sender = update.effective_user
     if not sender or sender.id not in KNOWN_MEMBER_IDS:
         return
@@ -1481,8 +1490,10 @@ def main() -> None:
     # /unklist command to list unknown members in the monitored group
     application.add_handler(CommandHandler("unklist", unklist_command))
 
-    # /knlist command to list known members
-    application.add_handler(CommandHandler("knlist", knlist_command))
+    # !knlist handler for known members to list known members
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!knlist"), handle_knlist_command)
+    )
 
     # !add @username handler for known members to manually track users
     application.add_handler(
@@ -1520,8 +1531,10 @@ def main() -> None:
     )
 
     # Catch-all handler to cache usernames from all messages in the monitored group
+    # Registered in group 1 so it doesn't conflict with command handlers in group 0
     application.add_handler(
-        MessageHandler(filters.TEXT & filters.Chat(chat_id=MONITORED_GROUP_ID), _cache_message_user)
+        MessageHandler(filters.TEXT & filters.Chat(chat_id=MONITORED_GROUP_ID), _cache_message_user),
+        group=1,
     )
 
     logger.info("Bot started — monitoring group activity...")

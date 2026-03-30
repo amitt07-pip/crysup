@@ -160,6 +160,7 @@ def _store_member_info(
     new_member_display: str,
     added_by_display: str,
     adder_id: int = 0,
+    adder_known: bool = True,
 ) -> None:
     """Store member display info in memory for callback lookups."""
     key = f"{new_member_id}:{group_chat_id}"
@@ -169,6 +170,7 @@ def _store_member_info(
         "adder_disp": added_by_display,
         "hours": hours,
         "adder_id": adder_id,
+        "adder_known": existing.get("adder_known", adder_known),
         "added_at": existing.get("added_at", datetime.now(timezone.utc)),
         "12h_used": existing.get("12h_used", False),
     }
@@ -734,6 +736,17 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"please kick both of them asap to avoid deal disruption."
         )
 
+        # Also track unknown-added members for /unklist
+        _store_member_info(
+            new_member_id=new_member.id,
+            group_chat_id=group_chat_id,
+            hours=0,
+            new_member_display=new_member_display,
+            added_by_display=added_by_display,
+            adder_id=added_by.id,
+            adder_known=False,
+        )
+
     try:
         await context.bot.send_message(
             chat_id=int(LOG_CHANNEL_ID),
@@ -751,24 +764,26 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List unknown members still in the monitored group and send to security channel."""
+    """List tracked members in the monitored group, split by known/unknown adder."""
     try:
         tracked_keys = list(_member_info.keys())
         if not tracked_keys:
             await context.bot.send_message(
                 chat_id=int(SECURITY_CHANNEL_ID),
-                text="📋 <b>Unknown Members List</b>\n\nNo tracked unknown members currently in the group.",
+                text="📋 <b>Tracked Members List</b>\n\nNo tracked members currently in the group.",
                 parse_mode="HTML",
             )
             return
 
-        lines = []
+        known_lines = []
+        unknown_lines = []
         now = datetime.now(timezone.utc)
         for key in tracked_keys:
             info = _member_info[key]
             member_disp = info.get("member_disp", "Unknown")
             adder_disp = info.get("adder_disp", "Unknown")
             added_at = info.get("added_at")
+            adder_known = info.get("adder_known", True)
             parts = key.split(":")
             member_id = parts[0]
             # Calculate duration since added
@@ -783,15 +798,27 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     duration_text = f"{minutes}m"
             else:
                 duration_text = "unknown"
-            lines.append(
-                f"• {member_disp} (<code>{member_id}</code>) — added by {adder_disp} — in group since {duration_text}"
+            line = f"• {member_disp} (<code>{member_id}</code>) — added by {adder_disp} — in group since {duration_text}"
+            if adder_known:
+                known_lines.append(line)
+            else:
+                unknown_lines.append(line)
+
+        sections = []
+        if known_lines:
+            sections.append(
+                f"👤 <b>Added by Known Members</b>\n" + "\n".join(known_lines)
+            )
+        if unknown_lines:
+            sections.append(
+                f"🚨 <b>Added by Unknown Members</b>\n" + "\n".join(unknown_lines)
             )
 
-        member_list = "\n".join(lines)
+        total = len(known_lines) + len(unknown_lines)
         message_text = (
             f"📋 <b>Tracked Members List</b>\n\n"
-            f"{member_list}\n\n"
-            f"Total: {len(lines)} member(s) with active security checks."
+            + "\n\n".join(sections)
+            + f"\n\nTotal: {total} member(s)."
         )
 
         await context.bot.send_message(
@@ -800,7 +827,7 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="HTML",
         )
     except Exception as e:
-        logger.error("Failed to send unknown members list: %s", e)
+        logger.error("Failed to send tracked members list: %s", e)
 
 
 async def _resolve_user(

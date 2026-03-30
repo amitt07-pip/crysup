@@ -330,6 +330,12 @@ async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     member_id = data["member_id"]
     group_id = data["group_id"]
 
+    # Skip if the member is now a known member (e.g. via !allow)
+    if member_id in KNOWN_MEMBER_IDS:
+        _cleanup_tracked_member(member_id, group_id, context)
+        logger.info("Skipping security check for %s — now a known member", member_id)
+        return
+
     # Verify member is still in the group before sending protocol message
     if not await _is_member_in_group(context.bot, member_id, group_id):
         _cleanup_tracked_member(member_id, group_id, context)
@@ -352,6 +358,26 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
     member_id = data["member_id"]
     group_id = data["group_id"]
     message_id = data["message_id"]
+
+    # Skip if the member is now a known member (e.g. via !allow)
+    if member_id in KNOWN_MEMBER_IDS:
+        _cleanup_tracked_member(member_id, group_id, context)
+        logger.info("Skipping auto-kick for %s — now a known member", member_id)
+        # Remove buttons from the message
+        sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
+        try:
+            msg = await context.bot.edit_message_reply_markup(
+                chat_id=sent_chat_id, message_id=message_id, reply_markup=None,
+            )
+            original_text = msg.text_html if hasattr(msg, "text_html") and msg.text_html else (msg.text or "")
+            await context.bot.edit_message_text(
+                chat_id=sent_chat_id, message_id=message_id,
+                text=f"{original_text}\n\nStatus: Member is now a known member",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
 
     # Verify member is still in the group before auto-kicking
     if not await _is_member_in_group(context.bot, member_id, group_id):
@@ -482,6 +508,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         existing_jobs = context.job_queue.get_jobs_by_name(job_name)
         for job in existing_jobs:
             job.schedule_removal()
+
+        # If the member is now a known member, stop the cycle
+        if member_id in KNOWN_MEMBER_IDS:
+            _member_info.pop(info_key, None)
+            _save_data()
+            await query.edit_message_text(
+                text=(
+                    f"✅ {new_member_display} is now a known member. No further checks needed.\n\n"
+                    f"- {new_member_display} (added by {added_by_display})"
+                ),
+                parse_mode="HTML",
+            )
+            return
 
         # Update the message to confirm, include member and adder info
         await query.edit_message_text(
@@ -651,6 +690,12 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Cache both users for !add @username lookup
     _cache_user(new_member)
     _cache_user(added_by)
+
+    # Skip tracking if the new member is themselves a known member
+    if new_member.id in KNOWN_MEMBER_IDS:
+        logger.info("Known member %s joined/added — skipping tracking", new_member.id)
+        return
+
     IST = timezone(timedelta(hours=5, minutes=30))
     timestamp = result.date or datetime.now(timezone.utc)
     ist_time = timestamp.astimezone(IST)

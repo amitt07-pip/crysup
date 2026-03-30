@@ -1247,7 +1247,7 @@ async def _handle_help_callback(query, category: str) -> None:
     """Handle help category button presses by editing the help message."""
     if category == "slash":
         text = (
-            "\ud83d\udcd6 <b>Slash Commands</b>\n\n"
+            "\U0001f4d6 <b>Slash Commands</b>\n\n"
             "\u2022 <code>/test</code> \u2014 Send a sample security protocol message to the current chat for testing.\n\n"
             "\u2022 <code>/unklist</code> \u2014 List all tracked members split by known/unknown adder. Sent to the security channel.\n\n"
             "\u2022 <code>!knlist</code> \u2014 List all known members (static + dynamically added). Sent to the security channel.\n\n"
@@ -1255,7 +1255,7 @@ async def _handle_help_callback(query, category: str) -> None:
         )
     elif category == "member":
         text = (
-            "\ud83d\udc65 <b>Member Management</b>\n\n"
+            "\U0001f465 <b>Member Management</b>\n\n"
             "\u2022 <code>!add @username / user_id / reply</code>\n"
             "  Manually add a user to the tracking list. Bot treats them like a newly added member.\n\n"
             "\u2022 <code>!allow @username / user_id / reply</code>\n"
@@ -1267,7 +1267,7 @@ async def _handle_help_callback(query, category: str) -> None:
         )
     elif category == "tools":
         text = (
-            "\ud83d\udee0\ufe0f <b>Bot Tools</b>\n\n"
+            "\U0001f6e0\ufe0f <b>Bot Tools</b>\n\n"
             "\u2022 <code>!refresh</code> \u2014 Check all tracked members' group membership and remove anyone who has left.\n\n"
             "\u2022 <code>!restart</code> \u2014 Clear all tracked members and cancel all pending timers. Starts from zero.\n\n"
             "\u2022 <code>!knlist</code> \u2014 List all known members.\n\n"
@@ -1306,8 +1306,8 @@ async def _handle_help_callback(query, category: str) -> None:
 def _build_help_main_text() -> str:
     """Build the main help menu text."""
     return (
-        "\ud83d\udcd6 <b>CryptoIndia Security Bot \u2014 Help</b>\n"
-        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "\U0001f4d6 <b>CryptoIndia Security Bot \u2014 Help</b>\n"
+        "\u2500" * 27 + "\n\n"
         "Welcome! This bot monitors group member activity, enforces a security protocol "
         "for newly added members, and provides tools for known members to manage the group.\n\n"
         "\u2022 <b>All timestamps</b> are in IST (UTC+5:30)\n"
@@ -1321,9 +1321,9 @@ def _build_help_keyboard(current_category: str = "main") -> InlineKeyboardMarkup
     """Build the help inline keyboard based on current category."""
     if current_category == "main":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("\ud83d\udccb Slash Commands", callback_data="help:slash")],
-            [InlineKeyboardButton("\ud83d\udc65 Member Management", callback_data="help:member")],
-            [InlineKeyboardButton("\ud83d\udee0\ufe0f Bot Tools", callback_data="help:tools")],
+            [InlineKeyboardButton("\U0001f4cb Slash Commands", callback_data="help:slash")],
+            [InlineKeyboardButton("\U0001f465 Member Management", callback_data="help:member")],
+            [InlineKeyboardButton("\U0001f6e0\ufe0f Bot Tools", callback_data="help:tools")],
             [InlineKeyboardButton("\u2699\ufe0f Automatic Behaviors", callback_data="help:auto")],
         ])
     else:
@@ -1405,7 +1405,7 @@ async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TY
 
         sections = []
         sections.append(
-            f"\ud83d\udd12 <b>Static Known Members ({len(static_lines)})</b>\n" + "\n".join(static_lines)
+            f"\U0001f512 <b>Static Known Members ({len(static_lines)})</b>\n" + "\n".join(static_lines)
         )
         if dynamic_lines:
             sections.append(
@@ -1414,7 +1414,7 @@ async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TY
 
         total = len(static_ids) + len(_dynamic_known)
         message_text = (
-            f"\ud83d\udccb <b>Known Members List</b>\n\n"
+            f"\U0001f4cb <b>Known Members List</b>\n\n"
             + "\n\n".join(sections)
             + f"\n\nTotal: {total} known member(s)."
         )
@@ -1548,14 +1548,14 @@ def main() -> None:
 
     application.add_error_handler(error_handler)
 
-    logger.info("\u2500" * 40)
+    logger.info("-" * 40)
     logger.info("CrySup Security Bot started")
     logger.info("Monitored group: %s", MONITORED_GROUP_ID)
     logger.info("Log channel: %s", LOG_CHANNEL_ID)
     logger.info("Security channel: %s", SECURITY_CHANNEL_ID)
     logger.info("Known members: %d static + %d dynamic", len(KNOWN_MEMBER_IDS) - len(_dynamic_known), len(_dynamic_known))
     logger.info("Tracked members: %d", len(_member_info))
-    logger.info("\u2500" * 40)
+    logger.info("-" * 40)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

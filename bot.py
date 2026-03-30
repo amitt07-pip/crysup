@@ -1172,6 +1172,37 @@ async def handle_refresh_command(update: Update, context: ContextTypes.DEFAULT_T
     logger.info("Refresh by %s: removed %d, remaining %d", sender.id, removed_count, total_remaining)
 
 
+async def handle_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !restart — clear all tracked members and cancel all timers."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!restart"):
+        return
+
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    # Cancel all jobs and clear tracking
+    cleared_count = len(_member_info)
+    for key in list(_member_info.keys()):
+        parts = key.split(":")
+        if len(parts) == 2:
+            member_id = int(parts[0])
+            group_id = int(parts[1])
+            _cleanup_tracked_member(member_id, group_id, context)
+
+    await message.reply_text(
+        f"Tracking list has been reset. Cleared <b>{cleared_count}</b> member(s).\n"
+        f"All pending security checks and auto-kick timers have been cancelled.",
+        parse_mode="HTML",
+    )
+    logger.info("Restart by %s: cleared %d tracked members", sender.id, cleared_count)
+
+
 async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently cache the sender's username from any message in the monitored group."""
     user = update.effective_user
@@ -1261,6 +1292,11 @@ def main() -> None:
     # !refresh handler for known members to refresh the tracking list
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!refresh"), handle_refresh_command)
+    )
+
+    # !restart handler for known members to reset all tracking
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!restart"), handle_restart_command)
     )
 
     # Catch-all handler to cache usernames from all messages in the monitored group

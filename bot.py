@@ -1307,7 +1307,7 @@ def _build_help_main_text() -> str:
     """Build the main help menu text."""
     return (
         "\U0001f4d6 <b>CryptoIndia Security Bot \u2014 Help</b>\n"
-        "\u2500" * 27 + "\n\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
         "Welcome! This bot monitors group member activity, enforces a security protocol "
         "for newly added members, and provides tools for known members to manage the group.\n\n"
         "\u2022 <b>All timestamps</b> are in IST (UTC+5:30)\n"

@@ -439,10 +439,18 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline button presses on security protocol messages."""
+    """Handle inline button presses on security protocol and help messages."""
     query = update.callback_query
 
     raw = query.data or ""
+
+    # Handle help category buttons
+    if raw.startswith("help:"):
+        category = raw.split(":", 1)[1]
+        await query.answer()
+        await _handle_help_callback(query, category)
+        return
+
     parts = raw.split(":")
     if len(parts) < 3:
         await query.answer()
@@ -1230,6 +1238,121 @@ async def handle_restart_command(update: Update, context: ContextTypes.DEFAULT_T
     logger.info("Restart by %s: cleared %d tracked members", sender.id, cleared_count)
 
 
+async def _handle_help_callback(query, category: str) -> None:
+    """Handle help category button presses by editing the help message."""
+    if category == "slash":
+        text = (
+            "\ud83d\udcd6 <b>Slash Commands</b>\n\n"
+            "\u2022 <code>/test</code> \u2014 Send a sample security protocol message to the current chat for testing.\n\n"
+            "\u2022 <code>/unklist</code> \u2014 List all tracked members split by known/unknown adder. Sent to the security channel.\n\n"
+            "\u2022 <code>/knlist</code> \u2014 List all known members (static + dynamically added). Sent to the security channel.\n\n"
+            "\u2022 <code>/help</code> \u2014 Show this help menu."
+        )
+    elif category == "member":
+        text = (
+            "\ud83d\udc65 <b>Member Management</b>\n\n"
+            "\u2022 <code>!add @username / user_id / reply</code>\n"
+            "  Manually add a user to the tracking list. Bot treats them like a newly added member.\n\n"
+            "\u2022 <code>!allow @username / user_id / reply</code>\n"
+            "  Promote a user to the known members list. They will be trusted by the bot.\n\n"
+            "\u2022 <code>!demote @username / user_id / reply</code>\n"
+            "  Remove a user from the known members list (only dynamically added members).\n\n"
+            "\u2022 <code>!12hr @username / user_id / reply</code>\n"
+            "  Apply a 12-hour skip for a tracked member. One-time use per tracked member."
+        )
+    elif category == "tools":
+        text = (
+            "\ud83d\udee0\ufe0f <b>Bot Tools</b>\n\n"
+            "\u2022 <code>!refresh</code> \u2014 Check all tracked members' group membership and remove anyone who has left.\n\n"
+            "\u2022 <code>!restart</code> \u2014 Clear all tracked members and cancel all pending timers. Starts from zero.\n\n"
+            "\u2022 <code>!help</code> \u2014 Show this help menu."
+        )
+    elif category == "auto":
+        text = (
+            "\u2699\ufe0f <b>Automatic Behaviors</b>\n\n"
+            "\u2022 <b>Known member adds someone</b> \u2014 Friendly log sent to the log channel + security check scheduled after 1 hour.\n\n"
+            "\u2022 <b>Unknown person adds someone</b> \u2014 Alert sent to the log channel with a warning. Member tracked in /unklist.\n\n"
+            "\u2022 <b>Security Protocol</b> \u2014 After 1 hour, asks the adder to confirm deal status with 3 buttons:\n"
+            "  \u2705 I am still doing deal \u2014 Resets timer, checks again in 1 hour\n"
+            "  \u274c Kick Member \u2014 Kicks the added member immediately\n"
+            "  +12 Hours \u2014 One-time skip for night/long deals\n\n"
+            "\u2022 <b>Auto-Kick</b> \u2014 If no button is clicked within 30 minutes.\n\n"
+            "\u2022 <b>Member Leaves</b> \u2014 Automatically removed from tracking."
+        )
+    elif category == "main":
+        # Go back to main help menu
+        text = _build_help_main_text()
+    else:
+        return
+
+    keyboard = _build_help_keyboard(category)
+
+    try:
+        await query.edit_message_text(
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.error("Failed to edit help message: %s", e)
+
+
+def _build_help_main_text() -> str:
+    """Build the main help menu text."""
+    return (
+        "\ud83d\udcd6 <b>CryptoIndia Security Bot \u2014 Help</b>\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+        "Welcome! This bot monitors group member activity, enforces a security protocol "
+        "for newly added members, and provides tools for known members to manage the group.\n\n"
+        "\u2022 <b>All timestamps</b> are in IST (UTC+5:30)\n"
+        "\u2022 <b>Commands with !</b> are for known members only\n"
+        "\u2022 <b>Commands work</b> in any group where the bot is present\n\n"
+        "Select a category below to learn more:"
+    )
+
+
+def _build_help_keyboard(current_category: str = "main") -> InlineKeyboardMarkup:
+    """Build the help inline keyboard based on current category."""
+    if current_category == "main":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\ud83d\udccb Slash Commands", callback_data="help:slash")],
+            [InlineKeyboardButton("\ud83d\udc65 Member Management", callback_data="help:member")],
+            [InlineKeyboardButton("\ud83d\udee0\ufe0f Bot Tools", callback_data="help:tools")],
+            [InlineKeyboardButton("\u2699\ufe0f Automatic Behaviors", callback_data="help:auto")],
+        ])
+    else:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("\u25c0\ufe0f Back to Menu", callback_data="help:main")],
+        ])
+
+
+async def handle_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle !help — show the help menu with inline buttons."""
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+    if not text.lower().startswith("!help"):
+        return
+
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    help_text = _build_help_main_text()
+    keyboard = _build_help_keyboard("main")
+
+    try:
+        await message.reply_text(
+            text=help_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.error("Failed to send help message: %s", e)
+
+
 async def knlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List all known members and send to the security channel."""
     sender = update.effective_user
@@ -1389,6 +1512,11 @@ def main() -> None:
     # !restart handler for known members to reset all tracking
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!restart"), handle_restart_command)
+    )
+
+    # !help handler for known members to show help menu
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!help"), handle_help_command)
     )
 
     # Catch-all handler to cache usernames from all messages in the monitored group

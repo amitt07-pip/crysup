@@ -776,6 +776,28 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.error("Failed to send log message: %s", e)
 
 
+async def _send_long_message(bot, chat_id: int, text: str) -> None:
+    """Send a message, splitting into multiple messages if it exceeds Telegram's 4096 char limit."""
+    max_len = 4000  # Leave some margin below 4096
+    if len(text) <= max_len:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        return
+
+    # Split by lines, accumulate chunks
+    lines = text.split("\n")
+    chunk = ""
+    for line in lines:
+        candidate = chunk + ("\n" if chunk else "") + line
+        if len(candidate) > max_len:
+            if chunk:
+                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+
+
 async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List tracked members in the monitored group, split by known/unknown adder."""
     try:
@@ -811,7 +833,7 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     duration_text = f"{minutes}m"
             else:
                 duration_text = "unknown"
-            line = f"• {member_disp} (<code>{member_id}</code>) — added by {adder_disp} — in group since {duration_text}"
+            line = f"\u2022 {member_disp} (<code>{member_id}</code>) \u2014 added by {adder_disp} \u2014 in group since {duration_text}"
             if adder_known:
                 known_lines.append(line)
             else:
@@ -820,25 +842,21 @@ async def unklist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         sections = []
         if known_lines:
             sections.append(
-                f"👤 <b>Added by Known Members</b>\n" + "\n".join(known_lines)
+                f"\U0001f464 <b>Added by Known Members ({len(known_lines)})</b>\n" + "\n".join(known_lines)
             )
         if unknown_lines:
             sections.append(
-                f"🚨 <b>Added by Unknown Members</b>\n" + "\n".join(unknown_lines)
+                f"\U0001f6a8 <b>Added by Unknown Members ({len(unknown_lines)})</b>\n" + "\n".join(unknown_lines)
             )
 
         total = len(known_lines) + len(unknown_lines)
         message_text = (
-            f"📋 <b>Tracked Members List</b>\n\n"
+            f"\U0001f4cb <b>Tracked Members List</b>\n\n"
             + "\n\n".join(sections)
             + f"\n\nTotal: {total} member(s)."
         )
 
-        await context.bot.send_message(
-            chat_id=int(SECURITY_CHANNEL_ID),
-            text=message_text,
-            parse_mode="HTML",
-        )
+        await _send_long_message(context.bot, int(SECURITY_CHANNEL_ID), message_text)
     except Exception as e:
         logger.error("Failed to send tracked members list: %s", e)
 
@@ -1419,11 +1437,7 @@ async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TY
             + f"\n\nTotal: {total} known member(s)."
         )
 
-        await context.bot.send_message(
-            chat_id=int(SECURITY_CHANNEL_ID),
-            text=message_text,
-            parse_mode="HTML",
-        )
+        await _send_long_message(context.bot, int(SECURITY_CHANNEL_ID), message_text)
         logger.info("!knlist sent to security channel")
     except Exception as e:
         logger.error("Failed to send known members list: %s", e)

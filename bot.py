@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import logging
@@ -454,6 +455,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         category = raw.split(":", 1)[1]
         await query.answer()
         await _handle_help_callback(query, category)
+        return
+
+    # Handle kickall retry button
+    if raw == "kickall:retry":
+        sender = query.from_user
+        if not sender or sender.id not in KNOWN_MEMBER_IDS:
+            await query.answer("Only known members can use this.", show_alert=True)
+            return
+        await query.answer("Retrying kick all...")
+        logger.info("Kickall retry triggered by user %s (id=%s)", sender.full_name, sender.id)
+        await _run_kickall(
+            context.bot,
+            chat_id=MONITORED_GROUP_ID,
+            status_chat_id=query.message.chat_id,
+            status_message_id=query.message.message_id,
+        )
         return
 
     parts = raw.split(":")
@@ -1450,6 +1467,203 @@ async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE
         _cache_user(user)
 
 
+async def _run_kickall(bot, chat_id: int, status_chat_id: int, status_message_id: int | None) -> None:
+    """Core kickall logic: kick non-known, non-admin members from the monitored group.
+
+    Stops when group member count drops below 100. Sends progress updates and
+    a retry button when finished.
+    """
+    group_id = MONITORED_GROUP_ID
+
+    # Get current member count
+    try:
+        member_count = await bot.get_chat_member_count(chat_id=group_id)
+    except Exception as e:
+        logger.error("Failed to get member count: %s", e)
+        await bot.send_message(
+            chat_id=status_chat_id,
+            text=f"\u274c Failed to get member count: {e}",
+            parse_mode="HTML",
+        )
+        return
+
+    if member_count < 100:
+        text = (
+            f"\u2139\ufe0f <b>Kick All \u2014 Skipped</b>\n\n"
+            f"Group has only <b>{member_count}</b> members (under 100 threshold)."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Retry Kick All", callback_data="kickall:retry")],
+        ])
+        if status_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=status_chat_id, message_id=status_message_id,
+                    text=text, parse_mode="HTML", reply_markup=keyboard,
+                )
+            except Exception:
+                await bot.send_message(chat_id=status_chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await bot.send_message(chat_id=status_chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    # Get admins to skip them
+    admin_ids: set[int] = set()
+    try:
+        admins = await bot.get_chat_administrators(chat_id=group_id)
+        admin_ids = {a.user.id for a in admins}
+    except Exception as e:
+        logger.warning("Failed to get admins: %s", e)
+
+    # Protected IDs: known members + admins + bot itself
+    bot_info = await bot.get_me()
+    protected_ids = KNOWN_MEMBER_IDS | admin_ids | {bot_info.id}
+
+    # Collect user IDs to kick from cache
+    user_ids_to_kick: list[int] = []
+    for _uname, info in _username_cache.items():
+        uid = info.get("user_id")
+        if uid and uid not in protected_ids:
+            user_ids_to_kick.append(uid)
+
+    # Also collect from tracked member info
+    for key in list(_member_info.keys()):
+        parts = key.split(":")
+        if len(parts) >= 1:
+            try:
+                uid = int(parts[0])
+                if uid not in protected_ids and uid not in user_ids_to_kick:
+                    user_ids_to_kick.append(uid)
+            except ValueError:
+                pass
+
+    if not user_ids_to_kick:
+        text = (
+            f"\U0001f4cb <b>Kick All \u2014 Complete</b>\n\n"
+            f"No kickable members found in cache.\n"
+            f"Current members: <b>{member_count}</b>\n\n"
+            f"<i>Note: The bot can only kick users it has seen in the group. "
+            f"More users will be detected as they send messages.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Retry Kick All", callback_data="kickall:retry")],
+        ])
+        if status_message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=status_chat_id, message_id=status_message_id,
+                    text=text, parse_mode="HTML", reply_markup=keyboard,
+                )
+            except Exception:
+                await bot.send_message(chat_id=status_chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await bot.send_message(chat_id=status_chat_id, text=text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    # Send initial status
+    status_text = (
+        f"\U0001f6a8 <b>Kick All \u2014 In Progress</b>\n\n"
+        f"Starting: <b>{member_count}</b> members\n"
+        f"Target users: <b>{len(user_ids_to_kick)}</b>\n"
+        f"Threshold: stops at <b>100</b> members"
+    )
+    if status_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=status_chat_id, message_id=status_message_id,
+                text=status_text, parse_mode="HTML",
+            )
+        except Exception:
+            msg = await bot.send_message(chat_id=status_chat_id, text=status_text, parse_mode="HTML")
+            status_message_id = msg.message_id
+    else:
+        msg = await bot.send_message(chat_id=status_chat_id, text=status_text, parse_mode="HTML")
+        status_message_id = msg.message_id
+
+    kicked = 0
+    failed = 0
+    skipped = 0
+
+    for uid in user_ids_to_kick:
+        # Check member count every 10 kicks
+        if kicked > 0 and kicked % 10 == 0:
+            try:
+                current_count = await bot.get_chat_member_count(chat_id=group_id)
+                if current_count < 100:
+                    logger.info("Kickall stopped: member count %d < 100", current_count)
+                    break
+            except Exception:
+                pass
+
+        try:
+            # Check if user is still in group
+            member = await bot.get_chat_member(chat_id=group_id, user_id=uid)
+            if member.status in (ChatMember.LEFT, ChatMember.BANNED):
+                skipped += 1
+                continue
+            if member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+                skipped += 1
+                continue
+
+            await bot.ban_chat_member(chat_id=group_id, user_id=uid)
+            await bot.unban_chat_member(chat_id=group_id, user_id=uid)
+            kicked += 1
+            logger.info("Kickall: kicked user %s (%d/%d)", uid, kicked, len(user_ids_to_kick))
+
+            # Rate limit: small delay between kicks to avoid Telegram flood control
+            await asyncio.sleep(0.5)
+
+        except Exception as e:
+            failed += 1
+            logger.warning("Kickall: failed to kick %s: %s", uid, e)
+            # If flood control, wait longer
+            if "flood" in str(e).lower() or "retry" in str(e).lower():
+                await asyncio.sleep(5)
+
+    # Get final member count
+    try:
+        final_count = await bot.get_chat_member_count(chat_id=group_id)
+    except Exception:
+        final_count = member_count - kicked
+
+    result_text = (
+        f"\U0001f4cb <b>Kick All \u2014 Complete</b>\n\n"
+        f"Members before: <b>{member_count}</b>\n"
+        f"Members now: <b>{final_count}</b>\n\n"
+        f"\u2705 Kicked: <b>{kicked}</b>\n"
+        f"\u274c Failed: <b>{failed}</b>\n"
+        f"\u23ed Skipped: <b>{skipped}</b> (left/admin/banned)"
+    )
+    if final_count >= 100:
+        result_text += f"\n\n<i>Group still has {final_count} members. Tap retry to kick more.</i>"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f504 Retry Kick All", callback_data="kickall:retry")],
+    ])
+
+    try:
+        await bot.edit_message_text(
+            chat_id=status_chat_id, message_id=status_message_id,
+            text=result_text, parse_mode="HTML", reply_markup=keyboard,
+        )
+    except Exception:
+        await bot.send_message(
+            chat_id=status_chat_id, text=result_text, parse_mode="HTML", reply_markup=keyboard,
+        )
+
+
+async def handle_kickall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /kickall — kick all non-known, non-admin members from the monitored group."""
+    sender = update.effective_user
+    if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    chat_id = update.effective_chat.id
+    logger.info("/kickall triggered by user %s (id=%s)", sender.full_name if sender else "?", sender.id if sender else "?")
+
+    await _run_kickall(context.bot, chat_id=MONITORED_GROUP_ID, status_chat_id=chat_id, status_message_id=None)
+
+
 async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a test security protocol message to the chat where /test is used."""
     test_member_display = "@test_member"
@@ -1508,6 +1722,9 @@ def main() -> None:
 
     # /unklist command to list unknown members in the monitored group
     application.add_handler(CommandHandler("unklist", unklist_command))
+
+    # /kickall command to kick all non-known members from the monitored group
+    application.add_handler(CommandHandler("kickall", handle_kickall_command))
 
     # !knlist handler for known members to list known members
     application.add_handler(

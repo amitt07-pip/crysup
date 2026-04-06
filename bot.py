@@ -31,7 +31,7 @@ logger = logging.getLogger("CrySup")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 SECURITY_CHANNEL_ID = "-1002215462357"
-MONITORED_GROUP_ID = -1003446573761
+MONITORED_GROUP_ID = -1003490229764
 
 # Known member user IDs — additions by these users are considered trusted
 KNOWN_MEMBER_IDS = {
@@ -741,6 +741,17 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         log_message = (
             f"~ {new_member_display} (<code>{new_member.id}</code>) has been added by "
             f"{added_by_display} (<code>{added_by.id}</code>) in the CryptoIndia Group ‼️"
+        )
+
+        # Store in tracking for /unklist
+        _store_member_info(
+            new_member_id=new_member.id,
+            group_chat_id=group_chat_id,
+            hours=1,
+            new_member_display=new_member_display,
+            added_by_display=added_by_display,
+            adder_id=added_by.id,
+            adder_known=True,
         )
 
         # Schedule security check after 1 hour

@@ -179,6 +179,12 @@ def _store_member_info(
         "adder_known": existing.get("adder_known", adder_known),
         "added_at": existing.get("added_at", datetime.now(timezone.utc)),
         "12h_used": existing.get("12h_used", False),
+        "12h_pending": existing.get("12h_pending", False),
+        "security_messages": existing.get("security_messages", []),
+        "12h_security_messages": existing.get("12h_security_messages", []),
+        "12h_orig_msg_id": existing.get("12h_orig_msg_id"),
+        "12h_orig_chat_id": existing.get("12h_orig_chat_id"),
+        "action_handled": existing.get("action_handled", False),
     }
     _save_data()
 
@@ -209,6 +215,49 @@ def _build_security_keyboard(
     return InlineKeyboardMarkup(keyboard)
 
 
+async def _update_security_messages(
+    bot,
+    info: dict,
+    status_append: str | None = None,
+    full_text: str | None = None,
+) -> None:
+    """Edit every stored security protocol message for a tracked member.
+
+    Either replaces the text with *full_text* or keeps the original text and
+    appends *status_append*.
+    """
+    for sec in info.get("security_messages", []):
+        chat_id = sec["chat_id"]
+        message_id = sec["message_id"]
+        try:
+            if full_text:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=full_text,
+                    parse_mode="HTML",
+                )
+                continue
+            msg = await bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+            original_text = ""
+            if hasattr(msg, "text_html") and msg.text_html:
+                original_text = msg.text_html
+            elif hasattr(msg, "text") and msg.text:
+                original_text = msg.text
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"{original_text}\n\n{status_append}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Failed to update security message %s in %s: %s", message_id, chat_id, e)
+
+
 async def send_security_check(
     context: ContextTypes.DEFAULT_TYPE,
     new_member_id: int,
@@ -216,51 +265,69 @@ async def send_security_check(
     hours: int,
     new_member_display: str,
     added_by_display: str,
-    target_chat_id: int | None = None,
     adder_id: int = 0,
 ) -> None:
-    """Send security protocol message and schedule auto-kick."""
-    send_to = target_chat_id or int(SECURITY_CHANNEL_ID)
+    """Send security protocol message to the security channel and the adder's DM, then schedule auto-kick."""
     message_text = _build_security_message(new_member_display, added_by_display, hours)
     keyboard = _build_security_keyboard(
         new_member_id, group_chat_id, hours, new_member_display, added_by_display,
         adder_id=adder_id,
     )
 
-    try:
-        sent_msg = await context.bot.send_message(
-            chat_id=send_to,
-            text=message_text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-        logger.info(
-            "Sent security check for member %s in group %s (hour %s)",
-            new_member_id,
-            group_chat_id,
-            hours,
-        )
+    # Send to the security channel and the adder's private chat
+    target_chats = [int(SECURITY_CHANNEL_ID)]
+    if adder_id:
+        target_chats.append(adder_id)
 
-        # Schedule auto-kick after 30 minutes if no response
-        job_name = f"autokick_{new_member_id}_{group_chat_id}"
-        # Remove any existing auto-kick job for this member
-        existing_jobs = context.job_queue.get_jobs_by_name(job_name)
-        for job in existing_jobs:
-            job.schedule_removal()
+    sent_messages = []
+    for chat_id in target_chats:
+        try:
+            sent_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            sent_messages.append({"chat_id": chat_id, "message_id": sent_msg.message_id})
+            logger.info(
+                "Sent security check for member %s in group %s (hour %s) to chat %s",
+                new_member_id,
+                group_chat_id,
+                hours,
+                chat_id,
+            )
+        except Exception as e:
+            logger.error("Failed to send security check to %s: %s", chat_id, e)
 
-        context.job_queue.run_once(
-            auto_kick_member,
-            when=AUTO_KICK_TIMEOUT,
-            name=job_name,
-            data={
-                "member_id": new_member_id,
-                "group_id": group_chat_id,
-                "message_id": sent_msg.message_id,
-                "sent_chat_id": send_to,
-            },
-        )
-    except Exception as e:
-        logger.error("Failed to send security check: %s", e)
+    if not sent_messages:
+        return
+
+    # Remember the sent messages so button actions can update every copy
+    info_key = f"{new_member_id}:{group_chat_id}"
+    if info_key in _member_info:
+        _member_info[info_key]["security_messages"] = sent_messages
+        _member_info[info_key]["action_handled"] = False
+        _save_data()
+
+    # Schedule auto-kick after 30 minutes if no response
+    job_name = f"autokick_{new_member_id}_{group_chat_id}"
+    # Remove any existing auto-kick job for this member
+    existing_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in existing_jobs:
+        job.schedule_removal()
+
+    context.job_queue.run_once(
+        auto_kick_member,
+        when=AUTO_KICK_TIMEOUT,
+        name=job_name,
+        data={
+            "member_id": new_member_id,
+            "group_id": group_chat_id,
+            "message_id": sent_messages[0]["message_id"],
+            "sent_chat_id": sent_messages[0]["chat_id"],
+            "security_messages": sent_messages,
+        },
+    )
 
 
 async def schedule_security_check(
@@ -367,56 +434,44 @@ async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-kick member after 30 minutes of no response."""
+    """Auto-kick member after 30 minutes of no response and update all security messages."""
     data = context.job.data
     member_id = data["member_id"]
     group_id = data["group_id"]
     message_id = data["message_id"]
 
+    info_key = f"{member_id}:{group_id}"
+    info = _member_info.get(info_key, {})
+    security_messages = data.get("security_messages") or info.get("security_messages", [])
+    if not security_messages and data.get("sent_chat_id") and message_id:
+        security_messages = [{"chat_id": data["sent_chat_id"], "message_id": message_id}]
+    if security_messages:
+        if info:
+            info["security_messages"] = security_messages
+            info["action_handled"] = True
+            _save_data()
+        else:
+            info = {"security_messages": security_messages}
+
     # Skip if the member is now a known member (e.g. via !allow)
     if member_id in KNOWN_MEMBER_IDS:
         _cleanup_tracked_member(member_id, group_id, context)
         logger.info("Skipping auto-kick for %s — now a known member", member_id)
-        # Remove buttons from the message
-        sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
-        try:
-            msg = await context.bot.edit_message_reply_markup(
-                chat_id=sent_chat_id, message_id=message_id, reply_markup=None,
-            )
-            original_text = msg.text_html if hasattr(msg, "text_html") and msg.text_html else (msg.text or "")
-            await context.bot.edit_message_text(
-                chat_id=sent_chat_id, message_id=message_id,
-                text=f"{original_text}\n\nStatus: Member is now a known member",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+        await _update_security_messages(
+            context.bot,
+            info,
+            status_append="Status: Member is now a known member",
+        )
         return
 
     # Verify member is still in the group before auto-kicking
     if not await _is_member_in_group(context.bot, member_id, group_id):
         _cleanup_tracked_member(member_id, group_id, context)
-        # Edit message to show they already left
-        sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
-        try:
-            msg = await context.bot.edit_message_reply_markup(
-                chat_id=sent_chat_id,
-                message_id=message_id,
-                reply_markup=None,
-            )
-            original_text = ""
-            if hasattr(msg, "text_html") and msg.text_html:
-                original_text = msg.text_html
-            elif hasattr(msg, "text") and msg.text:
-                original_text = msg.text
-            await context.bot.edit_message_text(
-                chat_id=sent_chat_id,
-                message_id=message_id,
-                text=f"{original_text}\n\nStatus: Member already left the group",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Failed to edit message for departed member: %s", e)
+        await _update_security_messages(
+            context.bot,
+            info,
+            status_append="Status: Member already left the group",
+        )
         return
 
     try:
@@ -424,28 +479,11 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
         logger.info("Auto-kicked member %s from group %s", member_id, group_id)
 
-        # Edit the security message: keep original text, remove buttons, append status
-        sent_chat_id = data.get("sent_chat_id", int(SECURITY_CHANNEL_ID))
-        try:
-            msg = await context.bot.edit_message_reply_markup(
-                chat_id=sent_chat_id,
-                message_id=message_id,
-                reply_markup=None,
-            )
-            original_text = ""
-            if hasattr(msg, "text_html") and msg.text_html:
-                original_text = msg.text_html
-            elif hasattr(msg, "text") and msg.text:
-                original_text = msg.text
-            await context.bot.edit_message_text(
-                chat_id=sent_chat_id,
-                message_id=message_id,
-                text=f"{original_text}\n\nStatus: Auto-Kicked (no response within 30 minutes)",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Failed to edit security message after auto-kick: %s", e)
-
+        await _update_security_messages(
+            context.bot,
+            info,
+            status_append="Status: Auto-Kicked (no response within 30 minutes)",
+        )
     except Exception as e:
         logger.error("Failed to auto-kick member %s from group %s: %s", member_id, group_id, e)
 
@@ -489,10 +527,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     group_id = int(parts[2])
     info_key = f"{member_id}:{group_id}"
 
-    # Only the known member who added this person can use the buttons
+    # Only the member who added this person can use the buttons, identified by user ID
     info = _member_info.get(info_key, {})
+    if not info:
+        await query.answer("This action is no longer active.", show_alert=True)
+        return
+
+    if info.get("action_handled"):
+        await query.answer("This action has already been handled.", show_alert=True)
+        return
+
     adder_id = int(info.get("adder_id", 0))
-    if adder_id and query.from_user.id != adder_id:
+    if not adder_id or query.from_user.id != adder_id:
         await query.answer("Only the person who added this member can use this button.", show_alert=True)
         return
 
@@ -501,9 +547,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("The +12 Hours skip has already been used for this member.", show_alert=True)
         return
 
+    if action == "h" and info.get("12h_pending"):
+        await query.answer("A +12 Hours confirmation is already pending.", show_alert=True)
+        return
+
     await query.answer()
 
     if action == "k":
+        # Mark the action handled so a tap on the other copy is ignored
+        info["action_handled"] = True
+        _member_info[info_key] = info
+        _save_data()
+
         # Cancel the auto-kick job
         job_name = f"autokick_{member_id}_{group_id}"
         existing_jobs = context.job_queue.get_jobs_by_name(job_name)
@@ -523,19 +578,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
             await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
-            # Keep original message, remove buttons, append status
-            original_text = query.message.text_html or query.message.text or ""
-            await query.edit_message_text(
-                text=f"{original_text}\n\nStatus: Kicked",
-                parse_mode="HTML",
+            await _update_security_messages(
+                context.bot,
+                info,
+                status_append="Status: Kicked",
             )
             logger.info("Kicked member %s from group %s via button", member_id, group_id)
         except Exception as e:
-            await query.edit_message_text(f"Failed to kick member: {e}")
+            await _update_security_messages(
+                context.bot,
+                info,
+                status_append=f"Failed to kick member: {e}",
+            )
             logger.error("Failed to kick member %s: %s", member_id, e)
 
     elif action == "d":
-        info = _member_info.get(info_key, {})
         hours = int(info.get("hours", 1))
         new_member_display = str(info.get("member_disp", "Unknown"))
         added_by_display = str(info.get("adder_disp", "Unknown"))
@@ -551,22 +608,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if member_id in KNOWN_MEMBER_IDS:
             _member_info.pop(info_key, None)
             _save_data()
-            await query.edit_message_text(
-                text=(
+            await _update_security_messages(
+                context.bot,
+                info,
+                full_text=(
                     f"✅ {new_member_display} is now a known member. No further checks needed.\n\n"
                     f"- {new_member_display} (added by {added_by_display})"
                 ),
-                parse_mode="HTML",
             )
             return
 
-        # Update the message to confirm, include member and adder info
-        await query.edit_message_text(
-            text=(
+        # Mark handled and clear any pending +12h state
+        info["action_handled"] = True
+        info["12h_pending"] = False
+        info["12h_security_messages"] = []
+        _member_info[info_key] = info
+        _save_data()
+
+        # Update all security messages to confirm the deal
+        await _update_security_messages(
+            context.bot,
+            info,
+            full_text=(
                 f"✅ Deal confirmed. Will check again in 1 hour.\n\n"
                 f"- {new_member_display} (added by {added_by_display})"
             ),
-            parse_mode="HTML",
         )
 
         # Schedule another check in 1 hour with incremented hours
@@ -582,32 +648,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif action == "h":
         # +12 Hours button — one-time use (already validated above)
-        info = _member_info.get(info_key, {})
-
-        # Send confirmation message with Yes/No buttons
-        confirm_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Yes", callback_data=f"hy:{member_id}:{group_id}")],
-            [InlineKeyboardButton("No", callback_data=f"hn:{member_id}:{group_id}")],
-        ])
-        # Store the original security message id for later editing
+        # Mark a confirmation as pending and store the security messages to update later
+        info["12h_pending"] = True
+        info["12h_security_messages"] = info.get("security_messages", [])
         info["12h_orig_msg_id"] = query.message.message_id
         info["12h_orig_chat_id"] = query.message.chat_id
         _member_info[info_key] = info
         _save_data()
 
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=(
-                "<b>This button can be used only One-Time for night deals "
-                "or time taking deals, please confirm your decision.</b>"
-            ),
-            parse_mode="HTML",
-            reply_markup=confirm_keyboard,
-        )
+        # Send confirmation message with Yes/No buttons in the chat where the button was pressed
+        confirm_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Yes", callback_data=f"hy:{member_id}:{group_id}")],
+            [InlineKeyboardButton("No", callback_data=f"hn:{member_id}:{group_id}")],
+        ])
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    "<b>This button can be used only One-Time for night deals "
+                    "or time taking deals, please confirm your decision.</b>"
+                ),
+                parse_mode="HTML",
+                reply_markup=confirm_keyboard,
+            )
+        except Exception as e:
+            logger.error("Failed to send +12h confirmation: %s", e)
 
     elif action == "hy":
         # Yes — confirm +12 Hours skip
-        info = _member_info.get(info_key, {})
         new_member_display = str(info.get("member_disp", "Unknown"))
         added_by_display = str(info.get("adder_disp", "Unknown"))
         stored_adder_id = int(info.get("adder_id", 0))
@@ -615,6 +683,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         # Mark as used
         info["12h_used"] = True
+        info["12h_pending"] = False
+        info["action_handled"] = True
         _member_info[info_key] = info
         _save_data()
 
@@ -630,29 +700,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for job in sec_jobs:
             job.schedule_removal()
 
-        # Edit the original security protocol message: keep text, remove buttons, add status
-        orig_msg_id = info.get("12h_orig_msg_id")
-        orig_chat_id = info.get("12h_orig_chat_id")
-        if orig_msg_id and orig_chat_id:
-            try:
-                orig_msg = await context.bot.edit_message_reply_markup(
-                    chat_id=orig_chat_id,
-                    message_id=orig_msg_id,
-                    reply_markup=None,
-                )
-                original_text = ""
-                if hasattr(orig_msg, "text_html") and orig_msg.text_html:
-                    original_text = orig_msg.text_html
-                elif hasattr(orig_msg, "text") and orig_msg.text:
-                    original_text = orig_msg.text
-                await context.bot.edit_message_text(
-                    chat_id=orig_chat_id,
-                    message_id=orig_msg_id,
-                    text=f"{original_text}\n\n<b>Status: Added 12 Hours Skip</b>",
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.error("Failed to edit original security message for 12h skip: %s", e)
+        # Update every stored security protocol message with the 12h skip status
+        security_messages = info.get("12h_security_messages") or info.get("security_messages", [])
+        if security_messages:
+            await _update_security_messages(
+                context.bot,
+                {"security_messages": security_messages},
+                status_append="<b>Status: Added 12 Hours Skip</b>",
+            )
 
         # Edit the confirmation message: remove buttons
         await query.edit_message_text(
@@ -674,6 +729,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elif action == "hn":
         # No — cancel +12 Hours skip, allow reuse
+        info["12h_pending"] = False
+        _member_info[info_key] = info
+        _save_data()
         await query.edit_message_text(
             text="<b>+12 Hours skip cancelled.</b>",
             parse_mode="HTML",

@@ -33,6 +33,9 @@ LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
 SECURITY_CHANNEL_ID = "-1002215462357"
 MONITORED_GROUP_ID = -1003490229764
 
+# Only this user can use /monitor to switch the monitored group
+MONITOR_ADMIN_ID = 6643621069
+
 # Known member user IDs — additions by these users are considered trusted
 KNOWN_MEMBER_IDS = {
     1166772148,
@@ -69,7 +72,7 @@ _dynamic_known: set[int] = set()
 
 
 def _save_data() -> None:
-    """Persist _member_info, _username_cache, and _dynamic_known to disk."""
+    """Persist _member_info, _username_cache, _dynamic_known, and monitored group to disk."""
     serializable_members = {}
     for key, val in _member_info.items():
         entry = dict(val)
@@ -82,6 +85,7 @@ def _save_data() -> None:
             "members": serializable_members,
             "username_cache": _username_cache,
             "dynamic_known": list(_dynamic_known),
+            "monitored_group_id": MONITORED_GROUP_ID,
         }
         _DATA_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -89,8 +93,8 @@ def _save_data() -> None:
 
 
 def _load_data() -> None:
-    """Load _member_info, _username_cache, and _dynamic_known from disk on startup."""
-    global _member_info, _username_cache, _dynamic_known
+    """Load _member_info, _username_cache, _dynamic_known, and monitored group from disk on startup."""
+    global _member_info, _username_cache, _dynamic_known, MONITORED_GROUP_ID
     if not _DATA_FILE.exists():
         return
     try:
@@ -110,6 +114,10 @@ def _load_data() -> None:
             _member_info[key] = val
         # Merge dynamic known members into the working set
         KNOWN_MEMBER_IDS.update(_dynamic_known)
+        # Restore the last monitored group if one was saved
+        saved_group_id = raw.get("monitored_group_id")
+        if saved_group_id is not None:
+            MONITORED_GROUP_ID = saved_group_id
         logger.info("Loaded %d member entries, %d cached usernames, %d dynamic known from disk",
                     len(_member_info), len(_username_cache), len(_dynamic_known))
     except Exception as e:
@@ -736,6 +744,86 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text="<b>+12 Hours skip cancelled.</b>",
             parse_mode="HTML",
         )
+
+
+async def _bot_has_monitor_permissions(bot, chat_id: int) -> tuple[bool, str]:
+    """Check whether the bot is an admin in *chat_id* with the rights needed to monitor it."""
+    try:
+        bot_info = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot_info.id)
+    except Exception as e:
+        return False, f"Cannot check the group: {e}. Make sure the bot is a member."
+    if bot_member.status != ChatMember.ADMINISTRATOR:
+        return False, "The bot must be an administrator in the new group."
+    if not getattr(bot_member, "can_restrict_members", False):
+        return False, "The bot needs the 'can restrict members' admin right."
+    try:
+        await bot.get_chat_administrators(chat_id=chat_id)
+        await bot.get_chat_member_count(chat_id=chat_id)
+    except Exception as e:
+        return False, f"Admin permission test failed: {e}."
+    return True, ""
+
+
+def _clear_all_tracking(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel all pending security/auto-kick jobs and clear the tracked members list."""
+    for key in list(_member_info.keys()):
+        parts = key.split(":")
+        if len(parts) == 2:
+            try:
+                member_id = int(parts[0])
+                group_id = int(parts[1])
+                _cleanup_tracked_member(member_id, group_id, context)
+            except ValueError:
+                continue
+    _member_info.clear()
+    _save_data()
+
+
+async def handle_monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the monitored group to a new chat ID. Only MONITOR_ADMIN_ID can use this."""
+    message = update.effective_message
+    sender = update.effective_user
+    if not message or not sender:
+        return
+
+    if sender.id != MONITOR_ADMIN_ID:
+        await message.reply_text("You are not authorized to use this command.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply_text("Usage: /monitor &lt;chat_id&gt;")
+        return
+
+    arg = parts[1].strip()
+    try:
+        if arg.lstrip("-").isdigit():
+            new_group_id = int(arg)
+        else:
+            if not arg.startswith("@"):
+                arg = f"@{arg}"
+            chat_obj = await context.bot.get_chat(chat_id=arg)
+            new_group_id = chat_obj.id
+    except Exception as e:
+        await message.reply_text(f"Invalid chat identifier: {e}")
+        return
+
+    ok, reason = await _bot_has_monitor_permissions(context.bot, new_group_id)
+    if not ok:
+        await message.reply_text(f"Cannot monitor {new_group_id}: {reason}")
+        return
+
+    global MONITORED_GROUP_ID
+    MONITORED_GROUP_ID = new_group_id
+
+    _clear_all_tracking(context)
+
+    await message.reply_text(
+        f"Now monitoring group <code>{new_group_id}</code>. Tracking list has been reset.",
+        parse_mode="HTML",
+    )
+    logger.info("Monitor group switched to %s by user %s", new_group_id, sender.id)
 
 
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1614,6 +1702,9 @@ async def handle_knlist_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def _cache_message_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently cache the sender's username from any message in the monitored group."""
+    chat = update.effective_chat
+    if not chat or chat.id != MONITORED_GROUP_ID:
+        return
     user = update.effective_user
     if user:
         _cache_user(user)
@@ -1878,6 +1969,9 @@ def main() -> None:
     # /kickall command to kick all non-known members from the monitored group
     application.add_handler(CommandHandler("kickall", handle_kickall_command))
 
+    # /monitor command to switch the monitored group (admin-only)
+    application.add_handler(CommandHandler("monitor", handle_monitor_command))
+
     # !knlist handler for known members to list known members
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!knlist"), handle_knlist_command)
@@ -1926,7 +2020,7 @@ def main() -> None:
     # Catch-all handler to cache usernames from all messages in the monitored group
     # Registered in group 1 so it doesn't conflict with command handlers in group 0
     application.add_handler(
-        MessageHandler(filters.TEXT & filters.Chat(chat_id=MONITORED_GROUP_ID), _cache_message_user),
+        MessageHandler(filters.TEXT, _cache_message_user),
         group=1,
     )
 

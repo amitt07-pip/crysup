@@ -193,6 +193,10 @@ def _store_member_info(
         "12h_orig_msg_id": existing.get("12h_orig_msg_id"),
         "12h_orig_chat_id": existing.get("12h_orig_chat_id"),
         "action_handled": existing.get("action_handled", False),
+        "log_message_id": existing.get("log_message_id"),
+        "log_chat_id": existing.get("log_chat_id"),
+        "log_status": existing.get("log_status"),
+        "log_status_updated": existing.get("log_status_updated", False),
     }
     _save_data()
 
@@ -264,6 +268,50 @@ async def _update_security_messages(
             )
         except Exception as e:
             logger.error("Failed to update security message %s in %s: %s", message_id, chat_id, e)
+
+
+async def _update_member_log_status(
+    bot,
+    member_id: int,
+    group_id: int,
+    status: str,
+    info: dict | None = None,
+) -> None:
+    """Edit the original log message for a tracked member to append the exit status."""
+    info_key = f"{member_id}:{group_id}"
+    if info is None:
+        info = _member_info.get(info_key)
+    if not info or info.get("log_status_updated"):
+        return
+
+    log_chat_id = info.get("log_chat_id")
+    log_message_id = info.get("log_message_id")
+    if not log_chat_id or not log_message_id:
+        return
+
+    try:
+        msg = await bot.edit_message_reply_markup(
+            chat_id=log_chat_id,
+            message_id=log_message_id,
+            reply_markup=None,
+        )
+        original_text = ""
+        if hasattr(msg, "text_html") and msg.text_html:
+            original_text = msg.text_html
+        elif hasattr(msg, "text") and msg.text:
+            original_text = msg.text
+        await bot.edit_message_text(
+            chat_id=log_chat_id,
+            message_id=log_message_id,
+            text=f"{original_text}\n\n<b>Status: {status}</b>",
+            parse_mode="HTML",
+        )
+        info["log_status"] = status
+        info["log_status_updated"] = True
+        if info_key in _member_info and _member_info[info_key] is info:
+            _save_data()
+    except Exception as e:
+        logger.error("Failed to update log status for %s: %s", info_key, e)
 
 
 async def send_security_check(
@@ -383,17 +431,27 @@ async def schedule_security_check(
 
 async def _is_member_in_group(bot, member_id: int, group_id: int) -> bool:
     """Check if a user is still a member of the group."""
+    return _is_active_status(await _get_member_status(bot, member_id, group_id))
+
+
+async def _get_member_status(bot, member_id: int, group_id: int) -> str | None:
+    """Return the ChatMember.status for a user in a group, or None on error."""
     try:
         chat_member = await bot.get_chat_member(chat_id=group_id, user_id=member_id)
-        return chat_member.status in (
-            ChatMember.MEMBER,
-            ChatMember.ADMINISTRATOR,
-            ChatMember.OWNER,
-            ChatMember.RESTRICTED,
-        )
+        return chat_member.status
     except Exception as e:
-        logger.warning("Could not check membership for %s in %s: %s", member_id, group_id, e)
-        return False
+        logger.warning("Could not get membership status for %s in %s: %s", member_id, group_id, e)
+        return None
+
+
+def _is_active_status(status: str | None) -> bool:
+    """Return True if *status* means the user is currently a chat member."""
+    return status in (
+        ChatMember.MEMBER,
+        ChatMember.ADMINISTRATOR,
+        ChatMember.OWNER,
+        ChatMember.RESTRICTED,
+    )
 
 
 def _cleanup_tracked_member(member_id: int, group_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -426,7 +484,10 @@ async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Verify member is still in the group before sending protocol message
-    if not await _is_member_in_group(context.bot, member_id, group_id):
+    status = await _get_member_status(context.bot, member_id, group_id)
+    if not _is_active_status(status):
+        log_status = "banned" if status == ChatMember.BANNED else "left"
+        await _update_member_log_status(context.bot, member_id, group_id, log_status)
         _cleanup_tracked_member(member_id, group_id, context)
         return
 
@@ -473,13 +534,16 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Verify member is still in the group before auto-kicking
-    if not await _is_member_in_group(context.bot, member_id, group_id):
-        _cleanup_tracked_member(member_id, group_id, context)
+    status = await _get_member_status(context.bot, member_id, group_id)
+    if not _is_active_status(status):
+        log_status = "banned" if status == ChatMember.BANNED else "left"
+        await _update_member_log_status(context.bot, member_id, group_id, log_status, info=info)
         await _update_security_messages(
             context.bot,
             info,
             status_append="Status: Member already left the group",
         )
+        _cleanup_tracked_member(member_id, group_id, context)
         return
 
     try:
@@ -487,13 +551,21 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
         logger.info("Auto-kicked member %s from group %s", member_id, group_id)
 
+        await _update_member_log_status(context.bot, member_id, group_id, "kicked", info=info)
         await _update_security_messages(
             context.bot,
             info,
             status_append="Status: Auto-Kicked (no response within 30 minutes)",
         )
+        _cleanup_tracked_member(member_id, group_id, context)
     except Exception as e:
         logger.error("Failed to auto-kick member %s from group %s: %s", member_id, group_id, e)
+        await _update_security_messages(
+            context.bot,
+            info,
+            status_append=f"Status: Auto-kick failed: {e}",
+        )
+        _cleanup_tracked_member(member_id, group_id, context)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -579,13 +651,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for job in sec_jobs:
             job.schedule_removal()
 
-        # Clean up stored info
-        _member_info.pop(info_key, None)
-        _save_data()
-
         try:
             await context.bot.ban_chat_member(chat_id=group_id, user_id=member_id)
             await context.bot.unban_chat_member(chat_id=group_id, user_id=member_id)
+            await _update_member_log_status(
+                context.bot, member_id, group_id, "kicked", info=info
+            )
             await _update_security_messages(
                 context.bot,
                 info,
@@ -599,6 +670,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 status_append=f"Failed to kick member: {e}",
             )
             logger.error("Failed to kick member %s: %s", member_id, e)
+        finally:
+            # Clean up stored info
+            _member_info.pop(info_key, None)
+            _save_data()
 
     elif action == "d":
         hours = int(info.get("hours", 1))
@@ -863,6 +938,13 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         _cache_user(left_user)
         info_key = f"{left_user.id}:{result.chat.id}"
         if info_key in _member_info:
+            if new_status == ChatMember.BANNED:
+                log_status = "banned"
+            elif new_status == ChatMember.LEFT:
+                log_status = "left"
+            else:
+                log_status = "removed"
+            await _update_member_log_status(context.bot, left_user.id, result.chat.id, log_status)
             _cleanup_tracked_member(left_user.id, result.chat.id, context)
         return
 
@@ -944,11 +1026,16 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     try:
-        await context.bot.send_message(
+        sent_msg = await context.bot.send_message(
             chat_id=int(LOG_CHANNEL_ID),
             text=log_message,
             parse_mode="HTML",
         )
+        info_key = f"{new_member.id}:{group_chat_id}"
+        if info_key in _member_info:
+            _member_info[info_key]["log_message_id"] = sent_msg.message_id
+            _member_info[info_key]["log_chat_id"] = int(LOG_CHANNEL_ID)
+            _save_data()
         logger.info(
             "Logged new member %s (added by %s, known=%s)",
             new_member.id,
@@ -1170,11 +1257,16 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"{adder_display} (<code>{sender.id}</code>) in the CryptoIndia Group ‼️"
         )
         try:
-            await context.bot.send_message(
+            sent_msg = await context.bot.send_message(
                 chat_id=int(LOG_CHANNEL_ID),
                 text=log_message,
                 parse_mode="HTML",
             )
+            info_key = f"{resolved_user_id}:{MONITORED_GROUP_ID}"
+            if info_key in _member_info:
+                _member_info[info_key]["log_message_id"] = sent_msg.message_id
+                _member_info[info_key]["log_chat_id"] = int(LOG_CHANNEL_ID)
+                _save_data()
         except Exception as e:
             logger.error("Failed to send !add log message: %s", e)
 
@@ -1429,9 +1521,10 @@ async def handle_kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.ban_chat_member(chat_id=MONITORED_GROUP_ID, user_id=resolved_user_id)
         await context.bot.unban_chat_member(chat_id=MONITORED_GROUP_ID, user_id=resolved_user_id)
 
-        # Clean up tracking if they were being tracked
+        # Update the log and clean up tracking if they were being tracked
         info_key = f"{resolved_user_id}:{MONITORED_GROUP_ID}"
         if info_key in _member_info:
+            await _update_member_log_status(context.bot, resolved_user_id, MONITORED_GROUP_ID, "kicked")
             _cleanup_tracked_member(resolved_user_id, MONITORED_GROUP_ID, context)
 
         kicker_display = _get_username_display(sender)
@@ -1463,18 +1556,21 @@ async def handle_refresh_command(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Iterate over all tracked members and check if they're still in the group
-    keys_to_remove: list[tuple[int, int]] = []
+    keys_to_remove: list[tuple[int, int, str]] = []
     for key in list(_member_info.keys()):
         parts = key.split(":")
         if len(parts) != 2:
             continue
         member_id = int(parts[0])
         group_id = int(parts[1])
-        if not await _is_member_in_group(context.bot, member_id, group_id):
-            keys_to_remove.append((member_id, group_id))
+        status = await _get_member_status(context.bot, member_id, group_id)
+        if not _is_active_status(status):
+            log_status = "banned" if status == ChatMember.BANNED else "left"
+            keys_to_remove.append((member_id, group_id, log_status))
 
     removed_count = 0
-    for member_id, group_id in keys_to_remove:
+    for member_id, group_id, log_status in keys_to_remove:
+        await _update_member_log_status(context.bot, member_id, group_id, log_status)
         _cleanup_tracked_member(member_id, group_id, context)
         removed_count += 1
 

@@ -70,9 +70,13 @@ _username_cache: dict[str, dict] = {}
 # Dynamic known members added via !allow (persisted to JSON)
 _dynamic_known: set[int] = set()
 
+# Paused state for !stop (persisted to JSON)
+_monitoring_paused: bool = False
+
 
 def _save_data() -> None:
-    """Persist _member_info, _username_cache, _dynamic_known, and monitored group to disk."""
+    """Persist _member_info, _username_cache, _dynamic_known, monitored group, and pause state to disk."""
+    global _monitoring_paused
     serializable_members = {}
     for key, val in _member_info.items():
         entry = dict(val)
@@ -86,6 +90,7 @@ def _save_data() -> None:
             "username_cache": _username_cache,
             "dynamic_known": list(_dynamic_known),
             "monitored_group_id": MONITORED_GROUP_ID,
+            "monitoring_paused": _monitoring_paused,
         }
         _DATA_FILE.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -93,8 +98,8 @@ def _save_data() -> None:
 
 
 def _load_data() -> None:
-    """Load _member_info, _username_cache, _dynamic_known, and monitored group from disk on startup."""
-    global _member_info, _username_cache, _dynamic_known, MONITORED_GROUP_ID
+    """Load _member_info, _username_cache, _dynamic_known, monitored group, and pause state from disk on startup."""
+    global _member_info, _username_cache, _dynamic_known, MONITORED_GROUP_ID, _monitoring_paused
     if not _DATA_FILE.exists():
         return
     try:
@@ -118,6 +123,8 @@ def _load_data() -> None:
         saved_group_id = raw.get("monitored_group_id")
         if saved_group_id is not None:
             MONITORED_GROUP_ID = saved_group_id
+        # Restore the paused state if it was saved
+        _monitoring_paused = raw.get("monitoring_paused", False)
         logger.info("Loaded %d member entries, %d cached usernames, %d dynamic known from disk",
                     len(_member_info), len(_username_cache), len(_dynamic_known))
     except Exception as e:
@@ -460,19 +467,22 @@ def _cleanup_tracked_member(member_id: int, group_id: int, context: ContextTypes
     if info_key in _member_info:
         _member_info.pop(info_key, None)
         _save_data()
-    # Cancel security check job
-    sec_jobs = context.job_queue.get_jobs_by_name(f"security_{member_id}_{group_id}")
-    for job in sec_jobs:
-        job.schedule_removal()
-    # Cancel auto-kick job
-    kick_jobs = context.job_queue.get_jobs_by_name(f"autokick_{member_id}_{group_id}")
-    for job in kick_jobs:
-        job.schedule_removal()
+    _cancel_member_jobs(member_id, group_id, context)
     logger.info("Cleaned up tracking for member %s in group %s (no longer in group)", member_id, group_id)
+
+
+def _cancel_member_jobs(member_id: int, group_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel pending security and auto-kick jobs for a tracked member without removing them."""
+    for job in context.job_queue.get_jobs_by_name(f"security_{member_id}_{group_id}"):
+        job.schedule_removal()
+    for job in context.job_queue.get_jobs_by_name(f"autokick_{member_id}_{group_id}"):
+        job.schedule_removal()
 
 
 async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job callback that sends the security check message."""
+    if _monitoring_paused:
+        return
     data = context.job.data
     member_id = data["member_id"]
     group_id = data["group_id"]
@@ -504,6 +514,8 @@ async def _security_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Auto-kick member after 30 minutes of no response and update all security messages."""
+    if _monitoring_paused:
+        return
     data = context.job.data
     member_id = data["member_id"]
     group_id = data["group_id"]
@@ -597,6 +609,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    # Handle monitor restart button from !stop
+    if raw == "monitor:restart":
+        if not query.from_user or query.from_user.id != MONITOR_ADMIN_ID:
+            await query.answer("Only the monitor admin can restart monitoring.", show_alert=True)
+            return
+        await _handle_monitor_restart(query, context)
+        return
+
     parts = raw.split(":")
     if len(parts) < 3:
         await query.answer()
@@ -632,6 +652,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await query.answer()
+
+    if _monitoring_paused and action in ("d", "k", "h", "hy", "hn"):
+        await query.answer("Monitoring is paused. Press Restart to resume.", show_alert=True)
+        return
 
     if action == "k":
         # Mark the action handled so a tap on the other copy is ignored
@@ -855,6 +879,95 @@ def _clear_all_tracking(context: ContextTypes.DEFAULT_TYPE) -> None:
     _save_data()
 
 
+async def _reschedule_security_checks(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-schedule security checks for every tracked member that is still in the group."""
+    for key, info in list(_member_info.items()):
+        parts = key.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            member_id = int(parts[0])
+            group_id = int(parts[1])
+        except ValueError:
+            continue
+
+        if info.get("action_handled") or info.get("log_status_updated"):
+            continue
+
+        status = await _get_member_status(context.bot, member_id, group_id)
+        if not _is_active_status(status):
+            log_status = "banned" if status == ChatMember.BANNED else "left"
+            await _update_member_log_status(context.bot, member_id, group_id, log_status)
+            _cleanup_tracked_member(member_id, group_id, context)
+            continue
+
+        member_disp = info.get("member_disp") or f"User {member_id}"
+        adder_disp = info.get("adder_disp") or "Unknown"
+        adder_id = info.get("adder_id", 0)
+        hours = info.get("hours", 1)
+        await schedule_security_check(
+            context,
+            new_member_id=member_id,
+            group_chat_id=group_id,
+            hours=hours,
+            new_member_display=member_disp,
+            added_by_display=adder_disp,
+            adder_id=adder_id,
+            delay_seconds=0,
+        )
+
+
+async def _handle_monitor_restart(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resume monitoring after a !stop and re-schedule checks for tracked members."""
+    global _monitoring_paused
+    _monitoring_paused = False
+    _save_data()
+    await _reschedule_security_checks(context)
+    await query.edit_message_text(
+        "<b>Monitoring restarted.</b> Security checks rescheduled for all tracked members.",
+        parse_mode="HTML",
+    )
+    logger.info("Monitoring restarted by admin %s", query.from_user.id)
+
+
+async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pause monitoring. Only MONITOR_ADMIN_ID can use this."""
+    global _monitoring_paused
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    if not message.text.strip().lower().startswith("!stop"):
+        return
+    sender = update.effective_user
+    if not sender or sender.id != MONITOR_ADMIN_ID:
+        return
+    if _monitoring_paused:
+        await message.reply_text("Monitoring is already paused.")
+        return
+
+    _monitoring_paused = True
+    _save_data()
+
+    for key in list(_member_info.keys()):
+        parts = key.split(":")
+        if len(parts) == 2:
+            try:
+                member_id = int(parts[0])
+                group_id = int(parts[1])
+                _cancel_member_jobs(member_id, group_id, context)
+            except ValueError:
+                continue
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Restart", callback_data="monitor:restart")]]
+    )
+    await message.reply_text(
+        "Monitoring has been paused. Tap the button below to resume.",
+        reply_markup=keyboard,
+    )
+    logger.info("Monitoring paused by admin %s", sender.id)
+
+
 async def handle_monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Switch the monitored group to a new chat ID. Only MONITOR_ADMIN_ID can use this."""
     message = update.effective_message
@@ -903,6 +1016,8 @@ async def handle_monitor_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle chat member updates — detect when someone is added to the group."""
+    if _monitoring_paused:
+        return
     if not LOG_CHANNEL_ID:
         logger.warning("LOG_CHANNEL_ID is not set. Skipping log.")
         return
@@ -1004,14 +1119,9 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     else:
         # Unknown person added someone — alert
         log_message = (
-            f"🚨 <b>MEMBER ADDED BY A UNKNOWN PERSON</b> ‼️\n"
-            f"\n"
-            f"Username - {new_member_display} (<code>{new_member.id}</code>)\n"
-            f"Added by - {added_by_display} (<code>{added_by.id}</code>)\n"
-            f"Date - {formatted_time}\n"
-            f"\n"
-            f"If it is not done by any of the group members "
-            f"please kick both of them asap to avoid deal disruption."
+            f"⚠️ <b>WARNING</b>: {new_member_display} (<code>{new_member.id}</code>) "
+            f"was added by {added_by_display} (<code>{added_by.id}</code>), "
+            f"who is <b>NOT</b> an admin, in the Crypto India group."
         )
 
         # Also track unknown-added members for /unklist
@@ -1210,6 +1320,10 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not sender or sender.id not in KNOWN_MEMBER_IDS:
         return
 
+    if _monitoring_paused:
+        await message.reply_text("Monitoring is currently paused. Use the Restart button to resume.")
+        return
+
     chat = update.effective_chat
     if not chat:
         return
@@ -1293,6 +1407,10 @@ async def handle_12hr_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Only known members can use this command
     sender = update.effective_user
     if not sender or sender.id not in KNOWN_MEMBER_IDS:
+        return
+
+    if _monitoring_paused:
+        await message.reply_text("Monitoring is currently paused. Use the Restart button to resume.")
         return
 
     chat = update.effective_chat
@@ -2106,6 +2224,11 @@ def main() -> None:
     # !restart handler for known members to reset all tracking
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!restart"), handle_restart_command)
+    )
+
+    # !stop handler to pause monitoring (monitor admin only)
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"(?i)^!stop"), handle_stop_command)
     )
 
     # !help handler for known members to show help menu

@@ -154,23 +154,61 @@ def _get_username_display(user) -> str:
     return user.full_name
 
 
+def _emoji(emoji_id: str, fallback: str) -> str:
+    """Render a Telegram custom emoji with a plain-emoji fallback."""
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+SECURITY_STATUS_DEFAULT = "Not Updated Yet"
+
+
+def _format_since(added_at, hours_fallback: int) -> str:
+    """Return a short duration like '1hr', '2hr', '35m' for how long a member has been in the group."""
+    if isinstance(added_at, datetime):
+        total_seconds = int((datetime.now(timezone.utc) - added_at).total_seconds())
+        hrs = total_seconds // 3600
+        mins = (total_seconds % 3600) // 60
+        if hrs > 0:
+            return f"{hrs}hr"
+        return f"{max(mins, 1)}m"
+    return f"{hours_fallback}hr"
+
+
 def _build_security_message(
     new_member_display: str,
     added_by_display: str,
     hours: int,
+    new_member_id: int = 0,
+    adder_id: int = 0,
+    added_at=None,
+    status: str = SECURITY_STATUS_DEFAULT,
 ) -> str:
     """Build the security protocol message."""
-    hour_text = f"{hours} hour" if hours == 1 else f"{hours} hours"
+    since = _format_since(added_at, hours)
+    member_id_text = f" <code>{new_member_id}</code>" if new_member_id else ""
+    adder_id_text = f" <code>{adder_id}</code>" if adder_id else ""
     return (
-        f"‼️ <b>SECURITY PROTOCOL</b> ‼️\n"
+        f"<b><u>CRYPTO INDIA SECURITY</u></b>\n"
+        f"{_emoji('5902335789798265487', '👤')}User: {new_member_display}{member_id_text}\n"
+        f"{_emoji('6041705726206808304', '➕')}Added by: {added_by_display}{adder_id_text}\n"
+        f"{_emoji('5893102202817352158', '⏱')}In group since: {since}\n"
+        f"{_emoji('5197288647275071607', '📌')} <b>Status</b>: {status}\n"
         f"\n"
-        f"{new_member_display} (added by {added_by_display}) "
-        f"is still in the group for more than {hour_text}, "
-        f'if the deal is still running then click on '
-        f'"<b>✅ I am still doing deal</b>" '
-        f'if not then click on "<b>❌ Kick Member</b>" '
-        f"please respond to the message within 30 minutes "
-        f"or the member will be auto kicked."
+        f"{_emoji('6008233706039284019', '❗')}Please confirm whether you are active in dealing or not"
+        f"{_emoji('6008233706039284019', '❗')}"
+    )
+
+
+def _security_message_from_info(member_id: int, info: dict, status: str) -> str:
+    """Rebuild the security protocol message for a tracked member with the given status."""
+    return _build_security_message(
+        new_member_display=str(info.get("member_disp", "Unknown")),
+        added_by_display=str(info.get("adder_disp", "Unknown")),
+        hours=int(info.get("hours", 1)),
+        new_member_id=member_id,
+        adder_id=int(info.get("adder_id", 0) or 0),
+        added_at=info.get("added_at"),
+        status=status,
     )
 
 
@@ -227,11 +265,20 @@ def _build_security_keyboard(
     callback_data_kick = f"k:{new_member_id}:{group_chat_id}"
     callback_data_12h = f"h:{new_member_id}:{group_chat_id}"
     keyboard = [
-        [InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal)],
-        [InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick)],
+        [InlineKeyboardButton("✅ Still In DeaL", callback_data=callback_data_deal)],
+        [InlineKeyboardButton("❌ Kick User", callback_data=callback_data_kick)],
         [InlineKeyboardButton("+12 Hours", callback_data=callback_data_12h)],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+async def _set_security_status(bot, member_id: int, info: dict, status: str) -> None:
+    """Rewrite every security protocol message for a member with the given Status line and drop the buttons."""
+    await _update_security_messages(
+        bot,
+        info,
+        full_text=_security_message_from_info(member_id, info, status),
+    )
 
 
 async def _update_security_messages(
@@ -331,10 +378,18 @@ async def send_security_check(
     adder_id: int = 0,
 ) -> None:
     """Send security protocol message to the security channel and the adder's DM, then schedule auto-kick."""
-    message_text = _build_security_message(new_member_display, added_by_display, hours)
     keyboard = _build_security_keyboard(
         new_member_id, group_chat_id, hours, new_member_display, added_by_display,
         adder_id=adder_id,
+    )
+    info = _member_info.get(f"{new_member_id}:{group_chat_id}", {})
+    message_text = _build_security_message(
+        new_member_display,
+        added_by_display,
+        hours,
+        new_member_id=new_member_id,
+        adder_id=adder_id,
+        added_at=info.get("added_at"),
     )
 
     # Send to the security channel and the adder's private chat
@@ -538,11 +593,7 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
     if member_id in KNOWN_MEMBER_IDS:
         _cleanup_tracked_member(member_id, group_id, context)
         logger.info("Skipping auto-kick for %s — now a known member", member_id)
-        await _update_security_messages(
-            context.bot,
-            info,
-            status_append="Status: Member is now a known member",
-        )
+        await _set_security_status(context.bot, member_id, info, "Member is now a known member")
         return
 
     # Verify member is still in the group before auto-kicking
@@ -550,11 +601,7 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_active_status(status):
         log_status = "banned" if status == ChatMember.BANNED else "left"
         await _update_member_log_status(context.bot, member_id, group_id, log_status, info=info)
-        await _update_security_messages(
-            context.bot,
-            info,
-            status_append="Status: Member already left the group",
-        )
+        await _set_security_status(context.bot, member_id, info, "Member already left the group")
         _cleanup_tracked_member(member_id, group_id, context)
         return
 
@@ -564,19 +611,13 @@ async def auto_kick_member(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Auto-kicked member %s from group %s", member_id, group_id)
 
         await _update_member_log_status(context.bot, member_id, group_id, "kicked", info=info)
-        await _update_security_messages(
-            context.bot,
-            info,
-            status_append="Status: Auto-Kicked (no response within 30 minutes)",
+        await _set_security_status(
+            context.bot, member_id, info, "User Kicked (auto, no response within 30 minutes)"
         )
         _cleanup_tracked_member(member_id, group_id, context)
     except Exception as e:
         logger.error("Failed to auto-kick member %s from group %s: %s", member_id, group_id, e)
-        await _update_security_messages(
-            context.bot,
-            info,
-            status_append=f"Status: Auto-kick failed: {e}",
-        )
+        await _set_security_status(context.bot, member_id, info, f"Auto-kick failed: {e}")
         _cleanup_tracked_member(member_id, group_id, context)
 
 
@@ -681,18 +722,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await _update_member_log_status(
                 context.bot, member_id, group_id, "kicked", info=info
             )
-            await _update_security_messages(
-                context.bot,
-                info,
-                status_append="Status: Kicked",
-            )
+            await _set_security_status(context.bot, member_id, info, "User Kicked")
             logger.info("Kicked member %s from group %s via button", member_id, group_id)
         except Exception as e:
-            await _update_security_messages(
-                context.bot,
-                info,
-                status_append=f"Failed to kick member: {e}",
-            )
+            await _set_security_status(context.bot, member_id, info, f"Failed to kick user: {e}")
             logger.error("Failed to kick member %s: %s", member_id, e)
         finally:
             # Clean up stored info
@@ -715,14 +748,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if member_id in KNOWN_MEMBER_IDS:
             _member_info.pop(info_key, None)
             _save_data()
-            await _update_security_messages(
-                context.bot,
-                info,
-                full_text=(
-                    f"✅ {new_member_display} is now a known member. No further checks needed.\n\n"
-                    f"- {new_member_display} (added by {added_by_display})"
-                ),
-            )
+            await _set_security_status(context.bot, member_id, info, "Member is now a known member")
             return
 
         # Mark handled and clear any pending +12h state
@@ -733,14 +759,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _save_data()
 
         # Update all security messages to confirm the deal
-        await _update_security_messages(
-            context.bot,
-            info,
-            full_text=(
-                f"✅ Deal confirmed. Will check again in 1 hour.\n\n"
-                f"- {new_member_display} (added by {added_by_display})"
-            ),
-        )
+        await _set_security_status(context.bot, member_id, info, "Added 1 Hour Skip")
 
         # Schedule another check in 1 hour with incremented hours
         await schedule_security_check(
@@ -810,10 +829,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Update every stored security protocol message with the 12h skip status
         security_messages = info.get("12h_security_messages") or info.get("security_messages", [])
         if security_messages:
-            await _update_security_messages(
+            await _set_security_status(
                 context.bot,
-                {"security_messages": security_messages},
-                status_append="<b>Status: Added 12 Hours Skip</b>",
+                member_id,
+                {**info, "security_messages": security_messages},
+                "Added 12 Hours Skip",
             )
 
         # Edit the confirmation message: remove buttons
@@ -1768,8 +1788,8 @@ async def _handle_help_callback(query, category: str) -> None:
             "\u2022 <b>Known member adds someone</b> \u2014 Friendly log sent to the log channel + security check scheduled after 1 hour.\n\n"
             "\u2022 <b>Unknown person adds someone</b> \u2014 Alert sent to the log channel with a warning. Member tracked in /unklist.\n\n"
             "\u2022 <b>Security Protocol</b> \u2014 After 1 hour, asks the adder to confirm deal status with 3 buttons:\n"
-            "  \u2705 I am still doing deal \u2014 Resets timer, checks again in 1 hour\n"
-            "  \u274c Kick Member \u2014 Kicks the added member immediately\n"
+            "  \u2705 Still In DeaL \u2014 Resets timer, checks again in 1 hour\n"
+            "  \u274c Kick User \u2014 Kicks the added member immediately\n"
             "  +12 Hours \u2014 One-time skip for night/long deals\n\n"
             "\u2022 <b>Auto-Kick</b> \u2014 If no button is clicked within 30 minutes.\n\n"
             "\u2022 <b>Member Leaves</b> \u2014 Automatically removed from tracking."
@@ -2129,13 +2149,16 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     test_chat_id = update.effective_chat.id
 
     # Build message and keyboard without storing in _member_info
-    message_text = _build_security_message(test_member_display, test_adder_display, 1)
+    message_text = _build_security_message(
+        test_member_display, test_adder_display, 1,
+        new_member_id=test_member_id, adder_id=987654321,
+    )
     callback_data_deal = f"d:{test_member_id}:{test_chat_id}"
     callback_data_kick = f"k:{test_member_id}:{test_chat_id}"
     callback_data_12h = f"h:{test_member_id}:{test_chat_id}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ I am still doing deal", callback_data=callback_data_deal)],
-        [InlineKeyboardButton("❌ Kick Member", callback_data=callback_data_kick)],
+        [InlineKeyboardButton("✅ Still In DeaL", callback_data=callback_data_deal)],
+        [InlineKeyboardButton("❌ Kick User", callback_data=callback_data_kick)],
         [InlineKeyboardButton("+12 Hours", callback_data=callback_data_12h)],
     ])
 

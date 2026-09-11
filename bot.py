@@ -161,6 +161,10 @@ def _emoji(emoji_id: str, fallback: str) -> str:
 
 SECURITY_STATUS_DEFAULT = "Not Updated Yet"
 
+# Custom emoji shown as icons on the security protocol buttons
+DEAL_BUTTON_EMOJI_ID = "5206607081334906820"
+KICK_BUTTON_EMOJI_ID = "5240241223632954241"
+
 
 def _format_since(added_at, hours_fallback: int) -> str:
     """Return a short duration like '1hr', '2hr', '35m' for how long a member has been in the group."""
@@ -265,8 +269,14 @@ def _build_security_keyboard(
     callback_data_kick = f"k:{new_member_id}:{group_chat_id}"
     callback_data_12h = f"h:{new_member_id}:{group_chat_id}"
     keyboard = [
-        [InlineKeyboardButton("✅ Still In DeaL", callback_data=callback_data_deal)],
-        [InlineKeyboardButton("❌ Kick User", callback_data=callback_data_kick)],
+        [InlineKeyboardButton(
+            "Still In DeaL", callback_data=callback_data_deal,
+            api_kwargs={"icon_custom_emoji_id": DEAL_BUTTON_EMOJI_ID},
+        )],
+        [InlineKeyboardButton(
+            "Kick User", callback_data=callback_data_kick,
+            api_kwargs={"icon_custom_emoji_id": KICK_BUTTON_EMOJI_ID},
+        )],
         [InlineKeyboardButton("+12 Hours", callback_data=callback_data_12h)],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -1325,6 +1335,31 @@ async def _resolve_user(
     return resolved_user_id, resolved_display
 
 
+async def _resolve_user_arg(
+    arg: str, context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[int | None, str | None]:
+    """Resolve a single @username or numeric user ID token to (user_id, display)."""
+    arg = arg.strip()
+    if arg.lstrip("-").isdigit():
+        try:
+            member = await context.bot.get_chat_member(chat_id=MONITORED_GROUP_ID, user_id=int(arg))
+            _cache_user(member.user)
+            return member.user.id, _get_username_display(member.user)
+        except Exception as e:
+            logger.warning("Could not resolve user ID %s: %s", arg, e)
+            return None, None
+    username_raw = arg.lstrip("@").lower()
+    cached = _username_cache.get(username_raw)
+    if cached:
+        return cached["user_id"], f"@{cached['username']}"
+    try:
+        chat_obj = await context.bot.get_chat(chat_id=f"@{username_raw}")
+        _cache_user(chat_obj)
+        return chat_obj.id, _get_username_display(chat_obj)
+    except Exception:
+        return None, None
+
+
 async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle !add @username — lets known members manually add users to tracking."""
     message = update.effective_message
@@ -1361,7 +1396,25 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     new_member_display = resolved_display or f"User {resolved_user_id}"
+
+    # Optional second argument: the known member who actually added the user
+    adder_id = sender.id
     adder_display = _get_username_display(sender)
+    arg_parts = text.split()
+    if len(arg_parts) >= 3:
+        alt_adder_id, alt_adder_display = await _resolve_user_arg(arg_parts[2], context)
+        if alt_adder_id is None:
+            await message.reply_text(
+                f"Could not resolve the adder {arg_parts[2]}. Make sure the username or user ID is correct.",
+            )
+            return
+        if alt_adder_id not in KNOWN_MEMBER_IDS:
+            await message.reply_text(
+                f"{alt_adder_display or arg_parts[2]} is not a known member, so they cannot be set as the adder.",
+            )
+            return
+        adder_id = alt_adder_id
+        adder_display = alt_adder_display or f"User {alt_adder_id}"
 
     # Store in member info — always use monitored group as the group_chat_id
     _store_member_info(
@@ -1370,7 +1423,7 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         hours=1,
         new_member_display=new_member_display,
         added_by_display=adder_display,
-        adder_id=sender.id,
+        adder_id=adder_id,
     )
 
     # Schedule security check after 1 hour
@@ -1381,14 +1434,14 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         hours=1,
         new_member_display=new_member_display,
         added_by_display=adder_display,
-        adder_id=sender.id,
+        adder_id=adder_id,
     )
 
     # Send log to log channel
     if LOG_CHANNEL_ID:
         log_message = (
             f"~ {new_member_display} (<code>{resolved_user_id}</code>) has been added by "
-            f"{adder_display} (<code>{sender.id}</code>) in the CryptoIndia Group ‼️"
+            f"{adder_display} (<code>{adder_id}</code>) in the CryptoIndia Group ‼️"
         )
         try:
             sent_msg = await context.bot.send_message(
@@ -1405,12 +1458,13 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error("Failed to send !add log message: %s", e)
 
     await message.reply_text(
-        f"{new_member_display} (<code>{resolved_user_id}</code>) has been manually added to tracking by {adder_display}.",
+        f"{new_member_display} (<code>{resolved_user_id}</code>) has been manually added to tracking "
+        f"(added by {adder_display}).",
         parse_mode="HTML",
     )
     logger.info(
-        "Known member %s manually added %s (%s) to tracking",
-        sender.id, resolved_user_id, new_member_display,
+        "Known member %s manually added %s (%s) to tracking, adder=%s",
+        sender.id, resolved_user_id, new_member_display, adder_id,
     )
 
 
@@ -2157,8 +2211,14 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     callback_data_kick = f"k:{test_member_id}:{test_chat_id}"
     callback_data_12h = f"h:{test_member_id}:{test_chat_id}"
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Still In DeaL", callback_data=callback_data_deal)],
-        [InlineKeyboardButton("❌ Kick User", callback_data=callback_data_kick)],
+        [InlineKeyboardButton(
+            "Still In DeaL", callback_data=callback_data_deal,
+            api_kwargs={"icon_custom_emoji_id": DEAL_BUTTON_EMOJI_ID},
+        )],
+        [InlineKeyboardButton(
+            "Kick User", callback_data=callback_data_kick,
+            api_kwargs={"icon_custom_emoji_id": KICK_BUTTON_EMOJI_ID},
+        )],
         [InlineKeyboardButton("+12 Hours", callback_data=callback_data_12h)],
     ])
 

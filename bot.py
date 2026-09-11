@@ -189,10 +189,11 @@ def _build_security_message(
 ) -> str:
     """Build the security protocol message."""
     since = _format_since(added_at, hours)
-    member_id_text = f" <code>{new_member_id}</code>" if new_member_id else ""
-    adder_id_text = f" <code>{adder_id}</code>" if adder_id else ""
+    member_id_text = f" [<code>{new_member_id}</code>]" if new_member_id else ""
+    adder_id_text = f" [<code>{adder_id}</code>]" if adder_id else ""
     return (
         f"<b><u>CRYPTO INDIA SECURITY</u></b>\n"
+        f"\n"
         f"{_emoji('5902335789798265487', '👤')}User: {new_member_display}{member_id_text}\n"
         f"{_emoji('6041705726206808304', '➕')}Added by: {added_by_display}{adder_id_text}\n"
         f"{_emoji('5893102202817352158', '⏱')}In group since: {since}\n"

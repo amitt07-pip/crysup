@@ -372,7 +372,7 @@ async def _update_member_log_status(
             original_text = msg.text_html
         elif hasattr(msg, "text") and msg.text:
             original_text = msg.text
-        body = f"<s>{original_text}</s>" if status == "left" else original_text
+        body = f"<s>{original_text}</s>"
         await bot.edit_message_text(
             chat_id=log_chat_id,
             message_id=log_message_id,

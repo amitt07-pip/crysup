@@ -283,6 +283,13 @@ def _build_security_keyboard(
     return InlineKeyboardMarkup(keyboard)
 
 
+def _build_log_kick_keyboard(new_member_id: int, group_chat_id: int) -> InlineKeyboardMarkup:
+    """Build the kick button attached to member-added log notifications."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Kick Member", callback_data=f"lk:{new_member_id}:{group_chat_id}")],
+    ])
+
+
 async def _set_security_status(bot, member_id: int, info: dict, status: str) -> None:
     """Rewrite every security protocol message for a member with the given Status line and drop the buttons."""
     await _update_security_messages(
@@ -365,10 +372,11 @@ async def _update_member_log_status(
             original_text = msg.text_html
         elif hasattr(msg, "text") and msg.text:
             original_text = msg.text
+        body = f"<s>{original_text}</s>" if status == "left" else original_text
         await bot.edit_message_text(
             chat_id=log_chat_id,
             message_id=log_message_id,
-            text=f"{original_text}\n\n<b>Status: {status}</b>",
+            text=f"{body}\n\n<b>Status: {status}</b>",
             parse_mode="HTML",
         )
         info["log_status"] = status
@@ -685,7 +693,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("This action is no longer active.", show_alert=True)
         return
 
-    if info.get("action_handled"):
+    if info.get("action_handled") and action != "lk":
         await query.answer("This action has already been handled.", show_alert=True)
         return
 
@@ -705,11 +713,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await query.answer()
 
-    if _monitoring_paused and action in ("d", "k", "h", "hy", "hn"):
+    if _monitoring_paused and action in ("d", "k", "h", "hy", "hn", "lk"):
         await query.answer("Monitoring is paused. Press Restart to resume.", show_alert=True)
         return
 
-    if action == "k":
+    if action in ("k", "lk"):
         # Mark the action handled so a tap on the other copy is ignored
         info["action_handled"] = True
         _member_info[info_key] = info
@@ -1171,6 +1179,7 @@ async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             chat_id=int(LOG_CHANNEL_ID),
             text=log_message,
             parse_mode="HTML",
+            reply_markup=_build_log_kick_keyboard(new_member.id, group_chat_id),
         )
         info_key = f"{new_member.id}:{group_chat_id}"
         if info_key in _member_info:
@@ -1449,6 +1458,7 @@ async def handle_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=int(LOG_CHANNEL_ID),
                 text=log_message,
                 parse_mode="HTML",
+                reply_markup=_build_log_kick_keyboard(resolved_user_id, MONITORED_GROUP_ID),
             )
             info_key = f"{resolved_user_id}:{MONITORED_GROUP_ID}"
             if info_key in _member_info:
